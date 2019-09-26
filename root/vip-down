@@ -1,0 +1,48 @@
+#!/bin/sh
+
+# Скрипт, опускающий виртуальный кластерный IP    v.0.9.02112014
+#
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) 2014 Leonid Krivoshein <klark.devel@gmail.com>
+#
+test -n "$1" -a -n "$2" || exit 250
+
+if /root/ic-cluster status >/dev/null 2>&1
+then
+    # Список практически всегда доступных хостов ЛВС
+    HL=0 ; LAN="10.0.0.1 10.0.0.253 10.0.0.254"
+    if /bin/ip addr show dev $1 2>/dev/null | /bin/grep -q "inet $2/24 " ; then
+	for IPADDR in $LAN ; do
+	    if /bin/ping -I $1 -c 1 -w 1 $IPADDR >/dev/null 2>&1 ; then
+		HL=1 ; break
+	    fi
+	done
+	unset IPADDR
+    fi
+    if [ $HL -ne 0 ] ; then
+	/root/ic-cluster stop >/dev/null 2>&1 ; /bin/sync
+    else
+	rm -f /tmp/fb-database/DATABASE.service 2>/dev/null
+	/etc/init.d/firebird2.5-super stop >/dev/null 2>&1
+    fi
+    unset LAN HL
+fi
+
+(   /bin/umount /home || /bin/umount -l /home
+    /sbin/drbdadm secondary all
+    /sbin/ifdown $1:ucarp
+) >/dev/null 2>&1
+
+exit 0

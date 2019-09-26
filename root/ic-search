@@ -1,0 +1,896 @@
+#!/bin/sh
+
+# Скрипт поиска/фильтрации доступных бэкапов "Инфоклиники"  v.0.9.07112014
+#
+# Ищет (выбирает) по заданным критериям  доступные бэкапы БД "Инфоклиника".
+# По умолчанию производится выборка всех доступных резервных копий БД  без
+# ограничений и  сортировка по типу, номерам уровней и времени их создания.
+# Дополнительные опции  позволяют сузить поиск  (отфильтровать результаты).
+# За исключением  проверки контрольных сумм файлов,  выполняется  проверка
+# целостности полных бэкапов и цепочек инкрементальных бэкапов, однако при
+# реальном восстановлении (через /root/ic-restore) контрольные суммы также
+# проверяются и, если они не совпадут, восстановление окажется невозможным.
+#
+# Другими словами,  настоящая утилита (теоретически)  может вывести больше
+# бэкапов,  нежели чем их есть реально пригодных для восстановления,  хотя
+# такая вероятность очень мала, поскольку проверяются ещё и размеры файлов.
+# Однако,  с опцией '-v' можно заранее проверить и контрольные суммы - это
+# значительно замедлит ход поиска/фильтрации, зато гарантирует пригодность
+# найденных бэкапов для восстановлния,  но использовать данную опцию лучше
+# всего после максимального сужения окончательной выборки бэкапов.
+#
+
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) 2014 Leonid Krivoshein <klark.devel@gmail.com>
+#
+
+# Константы
+AUTOSAVEDIR="/home/firebird"
+
+# Значения по умолчанию
+LAST_BUFFER=''
+MINUTE_MASK=''
+HOUR_MASK=''
+YEAR_MASK=''
+MONT_MASK=''
+WKNO_MASK=''
+WDAY_MASK=''
+DATE_MASK=''
+CHECKSUMS=0
+SHOWLEVEL=0
+LASTLEVEL=2
+ONLYLAST=0
+FULLPATH=0
+ONECOL=0
+SCOPE=''
+
+
+# Выводит экранную подсказку
+show_usage() {
+    echo "Использование: $0 -h | [другие опции...]
+
+Рекомендуемые порядок и сочетаемость основных опций:
+[-1 | -l] [-f] [-L] [-v] [<Область_поиска>] [<Временной_интервал>]
+
+где <Область_поиска> (\"где и как искать?\") определяется как:
+{-A | -F | -L0 | -L1 | -L2 | -LP}, а <Временной_интервал> как:
+[-Y yy] [-M mm|-lm|-pm|-lw|-pw] [-W Wkd|-D dd|-t|-y] [-H hh|-lh|-ph] [-m xx]
+
+Назначение каждой опции в отдельности:
+
+Опции глобального действия:
+ -h     Вывести данную страницу подсказки и выйти
+ -1     Выводить только список файлов в одну колонку
+ -l     Выводить сначала номер уровня (либо тип резервной копии)
+ -f     Выводить полные, а не относительные пути к файлам бэкапов
+ -L     Выводить только самую последнюю строку найденного результата
+ -v     Включить проверку контрольных сумм файлов при контроле целостности
+        пригодных для восстановления цепочек резервных копий (данный параметр
+        значительно замедляет работу, рекомендуется использовать только после
+        максимального сужения выборки)
+
+<Область_поиска>:
+ -A     Ограничить поиск полными бэкапами (GBZ), перенесёнными в архив
+ -F     Ограничить поиск полными бэкапами (GBZ) за последние 3 месяца
+ -L0    Ограничить поиск инкрементальными бэкапами только 0-го уровня
+ -L1    Ограничить поиск инкрементальными бэкапами 0-го и 1-го уровней
+ -L2    Ограничить поиск инкрементальными бэкапами всех трёх уровней
+ -LP    Ограничить поиск двумя последними инкрементальными бэкапами,
+        на которые указывают служебные файлы LAST и/или PREV
+
+<Временной_интервал>:
+ -Y yy  Искать в заданном годе <yy> - от 2014 (либо от 14 до 99)
+ -M mm  Искать в заданном месяце <mm> - от 01 до 12
+ -W Wkd Искать только по заданному дню недели <Wkd> (Пн=Mon,
+        Вт=Tue, Ср=Wed, Чт=Thu, Пт=Fri, Сб=Sat, Вс=Sun) (*)
+ -D dd  Искать по заданной дате месяца <dd> - от 01 до 31 (**)
+ -H hh  Искать в заданном часе суток <hh> - от 00 до 23 (*)
+ -m xx  Искать с заданным значением минут <xx> - от 00 до 59 (*)
+ -lm    Ограничить поиск текущим месяцем (Last Month)
+ -pm    Ограничить поиск прошедшим месяцем (Prev. Month)
+ -lw    Ограничить поиск текущей неделей (Last Week) (**)
+ -pw    Ограничить поиск прошедшей неделей (Prev. Week) (**)
+ -t     Ограничить поиск текущими сутками (Today) (**)
+ -y     Ограничить поиск прошедшими сутками (Yesterday) (**)
+ -lh    Ограничить поиск текущим часом суток (Last Hour) (*)
+ -ph    Ограничить поиск прошедшим часом суток (Prev. Hour) (*)
+
+ (*)    Данный фильтр применим только к инкрементальным бэкапам
+ (**)   Данный фильтр неприменим к полным бэкапам, перенесённым в архив
+"
+}
+
+
+# Возвращает 0, если указанный год ($1 - от 2000 до 2199) подлежит обработке
+accept_year() {
+    test "x$YEAR_MASK" = "x$1" -o -z "$YEAR_MASK"
+    return $?
+}
+
+
+# Возвращает 0, если указанный месяц ($1 - от 01 до 12) подлежит обработке
+accept_month() {
+    test "x$MONT_MASK" = "x$1" -o -z "$MONT_MASK"
+    return $?
+}
+
+
+# Возвращает 0, если указанная дата ($1 YYYY-MM-DD) входит в обрабатываемую неделю
+accept_week() {
+    test -n "$WKNO_MASK" || return 0
+    WKNO=`/bin/date --date="$1" +%V 2>/dev/null`
+    if [ "$WKNO_MASK" = "$WKNO" ] ; then
+	unset WKNO
+	return 0
+    fi
+    unset WKNO
+    return 1
+}
+
+
+# Возвращает 0, если указанный день недели ($1 - Sun, Mon, ...) подлежит обработке
+accept_wday() {
+    test "x$WDAY_MASK" = "x$1" -o -z "$WDAY_MASK"
+    return $?
+}
+
+
+# Возвращает 0, если указанное число месяца ($1 - от 01 до 31) подлежит обработке
+accept_date() {
+    test "x$DATE_MASK" = "x$1" -o -z "$DATE_MASK"
+    return $?
+}
+
+
+# Возвращает 0, если указанный час ($1 - от 00 до 23) подлежит обработке
+accept_hour() {
+    test "x$HOUR_MASK" = "x$1" -o -z "$HOUR_MASK"
+    return $?
+}
+
+
+# Возвращает 0, если указанная минута ($1 - от 00 до 59) подлежит обработке
+accept_minute() {
+    test "x$MINUTE_MASK" = "x$1" -o -z "$MINUTE_MASK"
+    return $?
+}
+
+
+# Проверяет контрольную сумму ($2) указанного файла ($1) и возвращает 0 в случае успеха
+valid_digest() {
+    TESTVAL=`/usr/bin/md5sum "$1" 2>/dev/null | /usr/bin/cut -f1 -d ' '`
+    if [ "x$TESTVAL" != "x$2" ] ; then
+	unset TESTVAL
+	return 1
+    fi
+    unset TESTVAL
+    return 0
+}
+
+
+# Обеспечивает форматированный вывод результата
+format_output() {
+    if [ $SHOWLEVEL -ne 0 -a $ONECOL -eq 0 ] ; then
+	LAST_BUFFER="$1 "
+    else
+	LAST_BUFFER=""
+    fi
+    if [ $FULLPATH -eq 0 ] ; then
+	LAST_BUFFER="${LAST_BUFFER}$2"
+    else
+	LAST_BUFFER="${LAST_BUFFER}${AUTOSAVEDIR}/$2"
+    fi
+    if [ $ONECOL -eq 0 ] ; then
+	LAST_BUFFER="${LAST_BUFFER} $3 $4"
+    fi
+    if [ $ONLYLAST -eq 0 ] ; then
+	echo "$LAST_BUFFER"
+	LAST_BUFFER=""
+    fi
+}
+
+
+# Обеспечивает поиск среди полных "ежемесячных" бэкапов (GBZ), перемещённых в архив
+search_arch_backups() {
+    test -d "archive" || return 0
+    test -z "$WKNO_MASK" || return 0
+    test -z "$WDAY_MASK" || return 0
+    test -z "$DATE_MASK" || return 0
+    test -z "$HOUR_MASK" || return 0
+    test -z "$MINUTE_MASK" || return 0
+    if [ -n "$YEAR_MASK" ] ; then
+	NAME_MASK="${YEAR_MASK}-"
+    else
+	NAME_MASK="2[0-9][0-9][0-9]-"
+    fi
+    if [ -n "$MONT_MASK" ] ; then
+	NAME_MASK="${NAME_MASK}${MONT_MASK}.meta"
+    else
+	NAME_MASK="${NAME_MASK}[0-1][0-9].meta"
+    fi
+    for PERIOD in `/usr/bin/find archive -maxdepth 1 -type f \
+	-name "$NAME_MASK" | /usr/bin/cut -c9-15 | /usr/bin/sort`
+    do
+	METANAME="archive/${PERIOD}.meta"
+	test -r "$METANAME" || continue
+	test -r "archive/${PERIOD}.gbz" || continue
+	FILENAME="archive/"`cat "$METANAME" 2>/dev/null | /usr/bin/cut -f4 -d ' '`
+	if [ "$FILENAME" != "archive/${PERIOD}.gbz" ] ; then
+	    unset FILENAME
+	    continue
+	fi
+	DUMMY=`/usr/bin/du -b "$FILENAME" 2>/dev/null | /usr/bin/cut -f1`
+	FULLDATE=`cat "$METANAME" 2>/dev/null | /usr/bin/cut -f1 -d ' '`
+	TM_STAMP=`cat "$METANAME" 2>/dev/null | /usr/bin/cut -f2 -d ' '`
+	FILESIZE=`cat "$METANAME" 2>/dev/null | /usr/bin/cut -f6 -d ' '`
+	if [ "x$DUMMY" = "x$FILESIZE" ] ; then
+	    if [ $CHECKSUMS -eq 0 ] ; then
+		format_output "A" "$FILENAME" "${FULLDATE}" "$TM_STAMP"
+	    else
+		DIGEST=`cat "$METANAME" 2>/dev/null | /usr/bin/cut -f5 -d ' '`
+		if valid_digest "$FILENAME" "$DIGEST" ; then
+		    format_output "A" "$FILENAME" "${FULLDATE}" "$TM_STAMP"
+		fi
+		unset DIGEST
+	    fi
+	fi
+	unset FILENAME DUMMY FULLDATE TM_STAMP FILESIZE
+    done
+    unset NAME_MASK PERIOD METANAME
+    return 0
+}
+
+
+# Обеспечивает поиск среди полных "ежесуточных" бэкапов (GBZ) за последние три месяца
+search_full_backups() {
+    test -z "$WDAY_MASK" || return 0
+    test -z "$HOUR_MASK" || return 0
+    test -z "$MINUTE_MASK" || return 0
+    DIRS=""
+    DUMMY=`/bin/date --date='2 month ago' +%Y-%m 2>/dev/null`
+    if [ -r "${DUMMY}/history.log" ] ; then
+	Y=`echo "$DUMMY" | /usr/bin/cut -f1 -d-`
+	M=`echo "$DUMMY" | /usr/bin/cut -f2 -d-`
+	if accept_year $Y && accept_month $M ; then
+	    DIRS="$DUMMY"
+	fi
+	unset Y M
+    fi
+    DUMMY=`/bin/date --date='month ago' +%Y-%m 2>/dev/null`
+    if [ -r "${DUMMY}/history.log" ] ; then
+	Y=`echo "$DUMMY" | /usr/bin/cut -f1 -d-`
+	M=`echo "$DUMMY" | /usr/bin/cut -f2 -d-`
+	if accept_year $Y && accept_month $M ; then
+	    if [ -n "$DIRS" ] ; then
+		DIRS="$DIRS $DUMMY"
+	    else
+		DIRS="$DUMMY"
+	    fi
+	fi
+	unset Y M
+    fi
+    DUMMY=`/bin/date +%Y-%m 2>/dev/null`
+    if [ -r "${DUMMY}/history.log" ] ; then
+	Y=`echo "$DUMMY" | /usr/bin/cut -f1 -d-`
+	M=`echo "$DUMMY" | /usr/bin/cut -f2 -d-`
+	if accept_year $Y && accept_month $M ; then
+	    if [ -n "$DIRS" ] ; then
+		DIRS="$DIRS $DUMMY"
+	    else
+		DIRS="$DUMMY"
+	    fi
+	fi
+	unset Y M
+    fi
+    if [ -z "$DIRS" ] ; then
+	unset DUMMY DIRS
+	return 0
+    fi
+    for SUBDIR in $DIRS ; do
+	for D in `/usr/bin/seq -w 1 31`
+	do
+	    if accept_date $D && accept_week "${SUBDIR}-${D}" ; then
+		DUMMY=`/bin/grep "${SUBDIR}-${D} " "${SUBDIR}/history.log" | /usr/bin/tail -n1`
+		if [ -n "$DUMMY" ] ; then
+		    TM_STAMP=`echo "$DUMMY" | /usr/bin/cut -f2 -d ' '`
+		    FILENAME=`echo "$DUMMY" | /usr/bin/cut -f4 -d ' '`
+		    DIGEST=`echo "$DUMMY"   | /usr/bin/cut -f5 -d ' '`
+		    FILESIZE=`echo "$DUMMY" | /usr/bin/cut -f6 -d ' '`
+		    if [ "x$FILENAME" = "xdaily-${D}.gbz" -a -r "${SUBDIR}/${FILENAME}" ] ; then
+			DUMMY=`/usr/bin/du -b "${SUBDIR}/${FILENAME}" 2>/dev/null | /usr/bin/cut -f1`
+			if [ "x$DUMMY" = "x$FILESIZE" ] ; then
+			    if [ $CHECKSUMS -eq 0 ] ; then
+				format_output "F" "${SUBDIR}/${FILENAME}" "${SUBDIR}-${D}" "$TM_STAMP"
+			    elif valid_digest "${SUBDIR}/${FILENAME}" "$DIGEST" ; then
+				format_output "F" "${SUBDIR}/${FILENAME}" "${SUBDIR}-${D}" "$TM_STAMP"
+			    fi
+			fi
+		    fi
+		    unset TM_STAMP FILENAME FILESIZE DIGEST
+		fi
+	    fi
+	done
+	unset D
+    done
+    unset DUMMY DIRS SUBDIR
+    return 0
+}
+
+
+# Обеспечивает поиск среди инкрементальных бэкапов (NGZ) последней рабочей недели
+search_incr_backups() {
+    DIRS=""
+    for WDAY_SHIFT in 6 5 4 3 2 1 0 ; do
+	DUMMY=`LANG=C /bin/date --date="$WDAY_SHIFT days ago" +%a 2>/dev/null`
+	accept_wday "$DUMMY" && test -d "$DUMMY" || continue
+	if [ -n "$DIRS" ] ; then
+	    DIRS="$DIRS $DUMMY"
+	else
+	    DIRS="$DUMMY"
+	fi
+    done
+    unset WDAY_SHIFT
+    L0ts="" ; L1ts=""
+    L0cs="" ; L1cs=""
+    L0guid="" ; L1guid=""
+    for SUBDIR in $DIRS ; do
+	for METAFILE in `/usr/bin/find $SUBDIR -maxdepth 1 -type f \
+	    -name '[0-2][0-9][0-5][0-9].meta' | /usr/bin/cut -c5-8 | /usr/bin/sort`
+	do
+	    FILENAME="${SUBDIR}/${METAFILE}.ngz"
+	    test -r "$FILENAME" || continue
+	    DUMMY=`cat "${SUBDIR}/${METAFILE}.meta" 2>/dev/null`
+	    test -n "$DUMMY" || continue
+	    FULLDATE=`echo "$DUMMY" | /usr/bin/cut -f1 -d ' '`
+	    Y=`echo "$FULLDATE" | /usr/bin/cut -f1 -d-`
+	    M=`echo "$FULLDATE" | /usr/bin/cut -f2 -d-`
+	    D=`echo "$FULLDATE" | /usr/bin/cut -f3 -d-`
+	    if accept_year "$Y" && accept_month "$M" && accept_date "$D" && accept_week "$FULLDATE" ; then
+		HH=`echo "$DUMMY" | /usr/bin/cut -f2 -d ' '`
+		MM=`echo "$DUMMY" | /usr/bin/cut -f3 -d ' '`
+		if [ "x$METAFILE" = "x${HH}${MM}" ] ; then
+		    LEVEL_NO=`echo "$DUMMY" | /usr/bin/cut -f4 -d ' '`
+		    if [ $LEVEL_NO -le $LASTLEVEL ] ; then
+			if [ $LEVEL_NO -gt 0 ] ; then
+			    p_ts=`echo "$DUMMY" | /usr/bin/cut -f10 -d ' '`
+			    p_cs=`echo "$DUMMY" | /usr/bin/cut -f11 -d ' '`
+			    p_guid=`echo "$DUMMY" | /usr/bin/cut -f12 -d ' '`
+			fi
+			chain=0
+			if [ "x$LEVEL_NO" = "x0" ] ; then
+			    chain=1
+			elif [ "x$LEVEL_NO" = "x1" ] ; then
+			    if [ "x$L0ts" = "x$p_ts" ] ; then
+				if [ "x$L0cs" = "x$p_cs" ] ; then
+				    if [ "x$L0guid" = "x$p_guid" ] ; then
+					chain=1
+				    fi
+				fi
+			    fi
+			    unset p_ts p_cs p_guid
+			elif [ "x$LEVEL_NO" = "x2" ] ; then
+			    if [ "x$L1ts" = "x$p_ts" ] ; then
+				if [ "x$L1cs" = "x$p_cs" ] ; then
+				    if [ "x$L1guid" = "x$p_guid" ] ; then
+					chain=1
+				    fi
+				fi
+			    fi
+			    unset p_ts p_cs p_guid
+			fi
+			if [ $chain -ne 0 ] ; then
+			    REALSIZE=`/usr/bin/du -b "$FILENAME" 2>/dev/null | /usr/bin/cut -f1`
+			    FILESIZE=`echo "$DUMMY" | /usr/bin/cut -f8 -d ' '`
+			    test "x$FILESIZE" = "x$REALSIZE" || chain=0
+			    unset REALSIZE FILESIZE
+			fi
+			if [ $chain -ne 0 -a $CHECKSUMS -ne 0 ] ; then
+			    DIGEST=`echo "$DUMMY" | /usr/bin/cut -f6 -d ' '`
+			    valid_digest "$FILENAME" "$DIGEST" || chain=0
+			    unset DIGEST
+			fi
+			if [ $chain -ne 0 ] ; then
+			    if [ "x$LEVEL_NO" = "x0" ] ; then
+				PLV=""
+				L0ts="$METAFILE"
+				L0cs=`echo "$DUMMY" | /usr/bin/cut -f6 -d ' '`
+				L0guid=`echo "$DUMMY" | /usr/bin/cut -f7 -d ' '`
+			    elif [ "x$LEVEL_NO" = "x1" ] ; then
+				PLV=`echo "$L0ts" | /usr/bin/cut -c1-2`":"`echo "$L0ts" | /usr/bin/cut -c3-4`" "
+				L1ts="$METAFILE"
+				L1cs=`echo "$DUMMY" | /usr/bin/cut -f6 -d ' '`
+				L1guid=`echo "$DUMMY" | /usr/bin/cut -f7 -d ' '`
+			    else
+				PLV=`echo "$L0ts" | /usr/bin/cut -c1-2`":"`echo "$L0ts" | /usr/bin/cut -c3-4`
+				PLV="$PLV "`echo "$L1ts" | /usr/bin/cut -c1-2`":"`echo "$L1ts" | /usr/bin/cut -c3-4`" "
+			    fi
+			    if accept_hour "$HH" && accept_minute "$MM" ; then
+				format_output "$LEVEL_NO" "$FILENAME" "$FULLDATE" "${PLV}${HH}:${MM}"
+			    fi
+			    unset PLV
+			fi
+			unset chain
+		    fi
+		    unset LEVEL_NO
+		fi
+		unset HH MM
+	    fi
+	    unset FULLDATE Y M D
+	done
+    done
+    unset L0ts L1ts L0cs L1cs L0guid L1guid
+    unset DIRS SUBDIR METAFILE FILENAME DUMMY
+    return 0
+}
+
+
+# Выводит в качестве результата поле N $1 из LAST-файла
+lb_field() {
+    echo "$LAST_CONTENT" | /usr/bin/cut -f$1 -d ' '
+}
+
+
+# Возвращает 0 (TRUE), если бэкап $LVts необходимо проверить,
+# 1 - если он уже был проверен и был признан подходящим бэкапом,
+# 2 - если он уже был проверен и при этом был забракован
+#
+image_need_check() {
+    RESULT="BAD/${FULLDATE}/${LVts}"
+    test -n "$PASSED_IMAGES" || return 0
+    DUMMY1="YES/${FULLDATE}/${LVts}"
+    for CHK in $PASSED_IMAGES ; do
+	if [ "x$CHK" = "x$DUMMY1" ] ; then
+	    unset RESULT DUMMY1 CHK
+	    return 1
+	elif [ "x$CHK" = "x$RESULT" ] ; then
+	    unset RESULT DUMMY1 CHK
+	    return 2
+	fi
+    done
+    unset DUMMY1 CHK
+    return 0
+}
+
+
+# Проверяет мета-данные бэкапа уровня N ($1) в цепочке
+check_level_internal() {
+    case $1 in
+    0) LVts="$L0ts" ; LVcs="$L0cs" ; LVguid="$L0guid" ;;
+    1) LVts="$L1ts" ; LVcs="$L1cs" ; LVguid="$L1guid" ;;
+    2) LVts="$L2ts" ; LVcs="$L2cs" ; LVguid="$L2guid" ;;
+    esac
+
+    # Соответствующий образ уже проверялся?
+    image_need_check ; RV=$?
+    if [ $RV -eq 2 ] ; then
+	unset LVts LVcs LVguid RV
+	return 20
+    elif [ $RV -eq 1 ] ; then
+	unset LVts LVcs LVguid RV
+	return 0
+    fi
+    unset RV
+
+    # Файлы бэкапа действительно существуют?
+    LVinfo="${WEEKDAY}/${LVts}.meta"
+    LVbackup="${WEEKDAY}/${LVts}.ngz"
+    if [ ! -r "$LVinfo" -o ! -r "$LVbackup" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup
+	return 1
+    fi
+    LVinfo=`cat "$LVinfo" 2>/dev/null`
+    if [ -z "$LVinfo" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup
+	return 2
+    fi
+
+    # YYYY-MM-DD
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f1 -d ' '`
+    if [ "x$dummy" != "x$FULLDATE" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup dummy
+	return 3
+    fi
+
+    # hh & mm
+    LVhh=`echo "$LVinfo" | /usr/bin/cut -f2 -d ' '`
+    LVmm=`echo "$LVinfo" | /usr/bin/cut -f3 -d ' '`
+    if [ "x${LVhh}${LVmm}" != "x$LVts" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	return 4
+    fi
+
+    # Level
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f4 -d ' '`
+    if [ "x$dummy" != "x$1" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	return 5
+    fi
+
+    # Hostname (field #5) - not used where
+
+    # MD5
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f6 -d ' '`
+    if [ "x$dummy" != "x$LVcs" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	return 6
+    fi
+
+    # GUID
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f7 -d ' '`
+    if [ "x$dummy" != "x$LVguid" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	return 7
+    fi
+
+    # Size
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f8 -d ' '`
+    dummy1=`/usr/bin/du -b "$LVbackup" 2>/dev/null | /usr/bin/cut -f1`
+    if [ "x$dummy" != "x$dummy1" ] ; then
+	unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy dummy1
+	return 8
+    fi
+    unset dummy1
+
+    # BackupID
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f9 -d ' '`
+    if ! eval 'test "$dummy" -gt 0' >/dev/null 2>&1 ; then
+	unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	return 9
+    fi
+
+    # При наличии ссылки на бэкап родительского уровня...
+    if [ $1 -gt 0 ]
+    then
+	# p_ts (L0/L1 <hhmm>)
+	dummy=`echo "$LVinfo" | /usr/bin/cut -f10 -d ' '`
+	if [ $1 -eq 2 -a "x$dummy" != "x$L1ts" ] ; then
+	    unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	    return 10
+	elif [ $1 -eq 1 -a "x$dummy" != "x$L0ts" ] ; then
+	    unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	    return 11
+	fi
+
+	# p_cs (L0/L1 <md5>)
+	dummy=`echo "$LVinfo" | /usr/bin/cut -f11 -d ' '`
+	if [ $1 -eq 2 -a "x$dummy" != "x$L1cs" ] ; then
+	    unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	    return 12
+	elif [ $1 -eq 1 -a "x$dummy" != "x$L0cs" ] ; then
+	    unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	    return 13
+	fi
+
+	# p_guid (L0/L1 <guid>)
+	dummy=`echo "$LVinfo" | /usr/bin/cut -f12 -d ' '`
+	if [ $1 -eq 2 -a "x$dummy" != "x$L1guid" ] ; then
+	    unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	    return 14
+	elif [ $1 -eq 1 -a "x$dummy" != "x$L0guid" ] ; then
+	    unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy
+	    return 15
+	fi
+    fi
+
+    # И снова MD5 (тут уже реальная проверка хэша)
+    if [ $CHECKSUMS -ne 0 ] ; then
+	dummy=`echo "$LVinfo" | /usr/bin/cut -f6 -d ' '`
+	dummy1=`/usr/bin/md5sum "$LVbackup" 2>/dev/null | /usr/bin/cut -f1 -d ' '`
+	if [ "x$dummy" != "x$dummy1" ] ; then
+	    unset LVts LVcs LVguid LVinfo LVbackup LVhh LVmm dummy dummy1
+	    return 16
+	fi
+    fi
+
+    # Если бэкап соответствует обозначенному времени, то добавляем его к общему выводу
+    RESULT="YES/${FULLDATE}/${LVts}"
+    if accept_hour "$LVhh" && accept_minute "$LVmm" ; then
+	if [ $1 -eq 0 ] ; then
+	    PLV=""
+	elif [ $1 -eq 1 ] ; then
+	    PLV=`echo "$L0ts" | /usr/bin/cut -c1-2`":"`echo "$L0ts" | /usr/bin/cut -c3-4`" "
+	else
+	    PLV=`echo "$L0ts" | /usr/bin/cut -c1-2`":"`echo "$L0ts" | /usr/bin/cut -c3-4`
+	    PLV="$PLV "`echo "$L1ts" | /usr/bin/cut -c1-2`":"`echo "$L1ts" | /usr/bin/cut -c3-4`" "
+	fi
+	format_output "$1" "$LVbackup" "$FULLDATE" "${PLV}${LVhh}:${LVmm}"
+	unset PLV
+    fi
+
+    unset LVts LVcs LVguid LVbkid LVinfo LVbackup LVhh LVmm dummy dummy1
+    return 0
+}
+
+
+# Обёртка над check_level_internal(), предотвращающая повторную проверку бэкапа
+check_level() {
+    check_level_internal $1 ; RV=$?
+
+    # При необходимости, добавляем этот бэкап в список уже проверенных
+    if [ -n "$RESULT" ] ; then
+	if [ -n "$PASSED_IMAGES" ] ; then
+	    PASSED_IMAGES="$PASSED_IMAGES $RESULT"
+	else
+	    PASSED_IMAGES="$RESULT"
+	fi
+	unset RESULT
+    fi
+
+    return $RV
+}
+
+
+# Проверяет бэкапы, указанные в переменной <$LAST_CONTENT>,
+# на предмет их пригодности для восстановления в связанной
+# цепочке, но только при условии, что они не проверялись до
+# этого. Пригодные для восстановления бэкапы присоединяются
+# к результирующему выводу.
+#
+check_last_content() {
+    LEVEL=`lb_field 3`
+    case "${LEVEL:-}" in
+    0|1|2)
+	;;
+    *)
+	unset LEVEL
+	return 0 ;;
+    esac
+    WEEKDAY=`lb_field 2`
+    if ! accept_wday "$WEEKDAY" ; then
+	unset LEVEL WEEKDAY
+	return 0
+    fi
+    FULLDATE=`lb_field 1`
+    if ! accept_week "$FULLDATE" ; then
+	unset LEVEL WEEKDAY FULLDATE
+	return 0
+    fi
+    Y=`echo "$FULLDATE" | /usr/bin/cut -f1 -d-`
+    if ! accept_year "$Y" ; then
+	unset LEVEL WEEKDAY FULLDATE Y
+	return 0
+    fi
+    M=`echo "$FULLDATE" | /usr/bin/cut -f2 -d-`
+    if ! accept_month "$M" ; then
+	unset LEVEL WEEKDAY FULLDATE Y M
+	return 0
+    fi
+    D=`echo "$FULLDATE" | /usr/bin/cut -f3 -d-`
+    if ! accept_date "$D" ; then
+	unset LEVEL WEEKDAY FULLDATE Y M D
+	return 0
+    fi
+    unset Y M D
+    L0ts=`lb_field 4`
+    L0cs=`lb_field 5`
+    L0guid=`lb_field 6`
+    if check_level 0 && test $LEVEL -gt 0
+    then
+	L1ts=`lb_field 7`
+	L1cs=`lb_field 8`
+	L1guid=`lb_field 9`
+	if check_level 1 && test $LEVEL -eq 2
+	then
+	    L2ts=`lb_field 10`
+	    L2cs=`lb_field 11`
+	    L2guid=`lb_field 12`
+	    check_level 2
+	    unset L2ts L2cs L2guid
+	fi
+	unset L1ts L1cs L1guid
+    fi
+    unset LEVEL WEEKDAY FULLDATE L0ts L0cs L0guid
+    return 0
+}
+
+
+# Обеспечивает поиск среди двух последних инкрементальных бэкапов
+# (NGZ), на которые указывают служебные файлы LAST и/или PREV
+#
+search_last_or_prev() {
+    PASSED_IMAGES=""
+    if [ -r PREV ] ; then
+	LAST_CONTENT=`cat PREV 2>/dev/null`
+	check_last_content
+    fi
+    if [ -r LAST ] ; then
+	LAST_CONTENT=`cat LAST 2>/dev/null`
+	check_last_content
+    fi
+    unset PASSED_IMAGES LAST_CONTENT RV
+    return 0
+}
+
+
+# Выводим справку до основного разбора командной строки
+if [ "x$1" = "x-h" ] ; then
+    show_usage
+    exit 0
+fi
+
+# Разбираем командную строку до проверки прав запуска скрипта
+while [ -n "$1" ]
+do
+    case "$1" in
+    -A) SCOPE="A" ;;
+    -F) SCOPE="F" ;;
+    -LP) SCOPE="L" ;;
+    -f) FULLPATH=1 ;;
+    -L)	ONLYLAST=1 ;;
+    -v) CHECKSUMS=1 ;;
+    -1)	ONECOL=1 ; SHOWLEVEL=0 ;;
+    -l) ONECOL=0 ; SHOWLEVEL=1 ;;
+    -L0) SCOPE="I" ; LASTLEVEL=0 ;;
+    -L1) SCOPE="I" ; LASTLEVEL=1 ;;
+    -L2) SCOPE="I" ; LASTLEVEL=2 ;;
+
+    -pm) # Только за прошедший месяц
+	YEAR_MASK=`LANG=C /bin/date --date='month ago' +%Y 2>/dev/null`
+	MONT_MASK=`LANG=C /bin/date --date='month ago' +%m 2>/dev/null`
+	;;
+    -lm) # Только за текущий месяц
+	YEAR_MASK=`LANG=C /bin/date +%Y 2>/dev/null`
+	MONT_MASK=`LANG=C /bin/date +%m 2>/dev/null`
+	;;
+    -pw) # Только за прошедшую неделю
+	YEAR_MASK=`LANG=C /bin/date --date='week ago' +%Y 2>/dev/null`
+	WKNO_MASK=`LANG=C /bin/date --date='week ago' +%V 2>/dev/null`
+	;;
+    -lw) # Только за текущую неделю
+	YEAR_MASK=`LANG=C /bin/date +%Y 2>/dev/null`
+	WKNO_MASK=`LANG=C /bin/date +%V 2>/dev/null`
+	;;
+    -y) # Только за прошедшие сутки
+	YEAR_MASK=`LANG=C /bin/date --date='day ago' +%Y 2>/dev/null`
+	MONT_MASK=`LANG=C /bin/date --date='day ago' +%m 2>/dev/null`
+	DATE_MASK=`LANG=C /bin/date --date='day ago' +%d 2>/dev/null`
+	;;
+    -t) # Только за текущие сутки
+	YEAR_MASK=`LANG=C /bin/date +%Y 2>/dev/null`
+	MONT_MASK=`LANG=C /bin/date +%m 2>/dev/null`
+	DATE_MASK=`LANG=C /bin/date +%d 2>/dev/null`
+	;;
+    -ph) # Только за прошедший час текущих суток
+	YEAR_MASK=`LANG=C /bin/date --date='hour ago' +%Y 2>/dev/null`
+	MONT_MASK=`LANG=C /bin/date --date='hour ago' +%m 2>/dev/null`
+	DATE_MASK=`LANG=C /bin/date --date='hour ago' +%d 2>/dev/null`
+	HOUR_MASK=`LANG=C /bin/date --date='hour ago' +%H 2>/dev/null`
+	test "$SCOPE" = "A" -o "$SCOPE" = "F" && SCOPE="I"
+	;;
+    -lh) # Только за текущий час текущих суток
+	YEAR_MASK=`LANG=C /bin/date +%Y 2>/dev/null`
+	MONT_MASK=`LANG=C /bin/date +%m 2>/dev/null`
+	DATE_MASK=`LANG=C /bin/date +%d 2>/dev/null`
+	HOUR_MASK=`LANG=C /bin/date +%H 2>/dev/null`
+	test "$SCOPE" = "A" -o "$SCOPE" = "F" && SCOPE="I"
+	;;
+
+    -Y)
+	shift
+	case "$1" in
+	[0-9][0-9])
+	    YEAR_MASK="20$1" ;;
+	2[0-9][0-9][0-9])
+	    YEAR_MASK="$1" ;;
+	*)
+	    echo "После опции '-Y' указывается <yy> - год, от 14 до 99 либо от 2014 до 2999"
+	    echo ""
+	    exit 1
+	esac
+	;;
+    -M)
+	shift
+	case "$1" in
+	[0-1][0-9])
+	    MONT_MASK="$1" ;;
+	*)
+	    echo "После опции '-M' указывается <mm> - месяц, от 01 до 12"
+	    echo ""
+	    exit 1
+	esac
+	;;
+    -W)
+	shift
+	case "$1" in
+	Mon|Tue|Wed|Thu|Fri|Sat|Sun)
+	    WDAY_MASK="$1" ;;
+	*)
+	    echo "После опции '-W' указывается <Wkd> - день недели (Mon,Tue,Wed,Thu,Fri,Sat,Sun)"
+	    echo ""
+	    exit 1
+	esac
+	;;
+    -D)
+	shift
+	case "$1" in
+	[0-3][0-9])
+	    DATE_MASK="$1" ;;
+	*)
+	    echo "После опции '-D' указывается <dd> - дата, от 01 до 31"
+	    echo ""
+	    exit 1
+	esac
+	;;
+    -H)
+	shift
+	case "$1" in
+	[0-2][0-9])
+	    HOUR_MASK="$1" ;;
+	*)
+	    echo "После опции '-H' указывается <hh> - часы, от 00 до 23"
+	    echo ""
+	    exit 1
+	esac
+	test "$SCOPE" = "A" -o "$SCOPE" = "F" && SCOPE="I"
+	;;
+    -m)
+	shift
+	case "$1" in
+	[0-5][0-9])
+	    MINUTE_MASK="$1" ;;
+	*)
+	    echo "После опции '-m' указывается <xx> - минуты, от 00 до 59"
+	    echo ""
+	    exit 1
+	esac
+	test "$SCOPE" = "A" -o "$SCOPE" = "F" && SCOPE="I"
+	;;
+
+    *)
+	echo "Неожиданный параметр: $1"
+	echo "Используйте '$0 -h' для получения справки"
+	echo ""
+	exit 1
+    esac
+    shift
+done
+
+# Отладка
+if /bin/false ; then
+    echo "MINUTE_MASK: '$MINUTE_MASK'" >&2
+    echo "HOUR_MASK:   '$HOUR_MASK'" >&2
+    echo "YEAR_MASK:   '$YEAR_MASK'" >&2
+    echo "MONT_MASK:   '$MONT_MASK'" >&2
+    echo "WKNO_MASK:   '$WKNO_MASK'" >&2
+    echo "WDAY_MASK:   '$WDAY_MASK'" >&2
+    echo "DATE_MASK:   '$DATE_MASK'" >&2
+    echo "CHECKSUMS:   $CHECKSUMS" >&2
+    echo "SHOWLEVEL:   $SHOWLEVEL" >&2
+    echo "LASTLEVEL:   $LASTLEVEL" >&2
+    echo "ONLYLAST:    $ONLYLAST" >&2
+    echo "FULLPATH:    $FULLPATH" >&2
+    echo "ONECOL:      $ONECOL" >&2
+    echo "SCOPE:       '$SCOPE'" >&2
+fi
+
+# Обычному пользователю этот скрипт недоступен
+test "x"`/usr/bin/id -u 2>/dev/null` = "x0" || exit 2
+
+# Переходим в папку с бэкапами
+cd "$AUTOSAVEDIR" || exit 3
+
+# Выбираем алгоритм(ы), в зависимости от области поиска
+case "x$SCOPE" in
+xL) search_last_or_prev ;;
+xI) search_incr_backups ;;
+xF) search_full_backups ;;
+xA) search_arch_backups ;;
+*)  search_arch_backups
+    search_full_backups
+    search_incr_backups ;;
+esac
+
+test -z "$LAST_BUFFER" || echo "$LAST_BUFFER"
+exit 0

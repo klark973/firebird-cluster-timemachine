@@ -1,0 +1,543 @@
+#!/bin/sh
+
+# Скрипт восстановления БД "Инфоклиника"  из бэкапов любого типа.
+# v.0.8.11112014
+#
+# Создаёт  (восстанавливает)   БД "Инфоклиника"   из  указанного
+# бэкапа. Запуск с единственной опцией -h (либо вообще без опций)
+# обеспечит администратора деталями использования данной утилиты.
+#
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) 2014 Leonid Krivoshein <klark.devel@gmail.com>
+#
+
+# Обычному пользователю этот скрипт недоступен
+test "x"`/usr/bin/id -u 2>/dev/null` = "x0" || exit 1
+
+# Подключаем блокиратор БД с общими определениями и
+# проверяем доступность обязательного скрипта поиска
+#
+test -r /root/ic-locker -a -x /root/ic-search || exit 2
+. /root/ic-locker
+
+# Значения по умолчанию
+NEED_STOP_FB=0
+NEED_RESTART_FB=0
+NEED_PREPARE_DB=1
+NEED_REPLACE_DB=0
+USE_LAST_BACKUP=0
+USE_FULL_BACKUP=0
+USE_OLD_DBIMAGE=0
+DATABASE_FILE=""
+BACKUP_FILE=""
+BACKUP_DIR=""
+LASTINFO=""
+OPTS=""
+NTS=""
+
+
+# Пытается восстановить БД из указанного  полного бэкапа .gbz,
+# и, в случае успеха, возвращает 0 (TRUE), а в случае неудачи -
+# возвращает код ошибки утилиты GBAK, либо 99, если возникнет
+# ошибка на этапе проверки архива, либо 100, если ошибка
+# произойдёт на этапе его распаковки.
+#
+restore_from_gbz() {
+    # Проверяем архив .gbz
+    GBZ="${BACKUP_DIR}/${BACKUP_FILE}.gbz"
+    CHK="${AUTOSAVEDIR}/"`/root/ic-search $OPTS 2>/dev/null`
+    if [ "$GBZ" != "$CHK" -o ! -r "$GBZ" ] ; then
+	unset GBZ CHK
+	return 99
+    fi
+    unset CHK
+
+    # Распаковываем архив .gbz
+    FBK="${AUTOSAVEDIR}/restored.fbk"
+    rm -f "$FBK" "$DATABASE_FILE" 2>/dev/null
+    if ! /bin/bunzip2 -qc < "$GBZ" > "$FBK" 2>/dev/null ; then
+	rm -f "$FBK" 2>/dev/null
+	unset GBZ FBK
+	return 100
+    fi
+    unset GBZ
+
+    # Создаём БД из распакованного бэкапа
+    fb_auth ; $GBAKCMD -c "$FBK" "$DATABASE_FILE" \
+		>/dev/null 2>&1 ; RV=$? ; fb_deauth
+    if [ $RV -ne 0 ] ; then
+	rm -f "$FBK" "$DATABASE_FILE" 2>/dev/null
+	unset FBK
+	return $RV
+    fi
+    rm -f "$FBK"
+    unset FBK RV
+    return 0
+}
+
+
+# Пытается обновить файл LAST, используя мета-данные .ngz архивов.
+# Архивы .ngz  определяются  директорией  ($BACKUP_DIR),  уровнем
+# ($LEVEL) и метками времени ($L0ts, $L1ts и $L2ts).  Дату бэкапа
+# в формате YYYY-MM-DD следует передавать первым параметром ($1).
+#
+update_last_info() {
+    TODAY=`LANG=C /bin/date +%Y-%m-%d 2>/dev/null`
+    if [ "x$TODAY" = "x$1" ] ; then
+	WDAY=`/usr/bin/basename "${BACKUP_DIR}"`
+	SR=`cat "${BACKUP_DIR}/${L0ts}.meta" 2>/dev/null`
+	LVcs=`echo "$SR" | /usr/bin/cut -f6 -d ' '`
+	LVguid=`echo "$SR" | /usr/bin/cut -f7 -d ' '`
+	LASTINFO="$TODAY $WDAY $LEVEL $L0ts $LVcs $LVguid"
+	if [ $LEVEL -gt 0 ] ; then
+	    SR=`cat "${BACKUP_DIR}/${L1ts}.meta" 2>/dev/null`
+	    LVcs=`echo "$SR" | /usr/bin/cut -f6 -d ' '`
+	    LVguid=`echo "$SR" | /usr/bin/cut -f7 -d ' '`
+	    LASTINFO="$LASTINFO $L1ts $LVcs $LVguid"
+	    if [ $LEVEL -eq 2 ] ; then
+		SR=`cat "${BACKUP_DIR}/${L2ts}.meta" 2>/dev/null`
+		LVcs=`echo "$SR" | /usr/bin/cut -f6 -d ' '`
+		LVguid=`echo "$SR" | /usr/bin/cut -f7 -d ' '`
+		LASTINFO="$LASTINFO $L2ts $LVcs $LVguid"
+	    fi
+	fi
+	unset WDAY LVcs LVguid
+    fi
+    unset TODAY
+    return 0
+}
+
+
+# Пытается восстановить БД  из указанного  инкрементального бэкапа.
+# При восстановлении будут также использованы  бэкапы родительских
+# уровней, если таковые имеются.  В случае успеха,  возвращается 0
+# (TRUE) и,  по окончанию востановления,  если дата использованных
+# бэкапов совпадает с текущей датой,  файл LAST воспроизводится по
+# мета-данным бэкапов.  В случае неудачи  -  возвращает код ошибки
+# утилиты NBACKUP,  либо 99, если ошибка будет обнаружена на этапе
+# проверки архивов,  либо 100,  если ошибка произойдёт на этапе их
+# распаковки.
+#
+# Единственный параметр $1 необязателен: он указывает на то, каким
+# образом должна использоваться  глобальная переменная $OPTS:  при
+# значении $1 = "ReadOPTS", $OPTS имеет формат вывода одной строки
+# скрипта '/root/ic-search',  а если опустить этот параметр, $OPTS
+# содержит опции запуска скрипта поиска.  В любом случае результат
+# поиска (SR) совершенно однозначно определяет  единственный инкре-
+# ментальный бэкап, из которого следует восстанавливать БД.
+#
+restore_from_ngz() {
+    # Проверяем архив(ы) .ngz
+    if [ "x$1" = "xReadOPTS" ] ; then
+	SR="$OPTS"
+    else
+	SR=`/root/ic-search $OPTS 2>/dev/null`
+    fi
+    if [ -z "$SR" ] ; then
+	unset SR
+	return 99
+    fi
+    LEVEL=`echo "$SR" | /usr/bin/cut -f1 -d ' '`
+    case "$LEVEL" in
+    0|1|2) ;;
+    *)	unset SR LEVEL
+	return 99 ;;
+    esac
+    CHK="${AUTOSAVEDIR}/"`echo "$SR" | /usr/bin/cut -f2 -d ' '`
+    if [ "$CHK" != "${BACKUP_DIR}/${BACKUP_FILE}.ngz" ] ; then
+	unset SR LEVEL CHK
+	return 99
+    fi
+    unset CHK
+    L1ts="" ; L2ts=""
+    L0ts=`echo "$SR" | /usr/bin/cut -f4 -d ' ' | /bin/sed 's/\://'`
+    if [ ! -r "${BACKUP_DIR}/${L0ts}.ngz" ] ; then
+	unset SR LEVEL L0ts L1ts L2ts
+	return 99
+    fi
+    if [ $LEVEL -eq 0 ] ; then
+	BACKUPS="L0.nbk"
+    else
+	L1ts=`echo "$SR" | /usr/bin/cut -f5 -d ' ' | /bin/sed 's/\://'`
+	if [ ! -r "${BACKUP_DIR}/${L1ts}.ngz" ] ; then
+	    unset SR LEVEL L0ts L1ts L2ts BACKUPS
+	    return 99
+	fi
+	if [ $LEVEL -eq 1 ] ; then
+	    BACKUPS="L0.nbk L1.nbk"
+	else
+	    L2ts=`echo "$SR" | /usr/bin/cut -f6 -d ' ' | /bin/sed 's/\://'`
+	    if [ ! -r "${BACKUP_DIR}/${L2ts}.ngz" ] ; then
+		unset SR LEVEL L0ts L1ts L2ts BACKUPS
+		return 99
+	    fi
+	    BACKUPS="L0.nbk L1.nbk L2.nbk"
+	fi
+    fi
+
+    # Распаковываем архив(ы) .ngz
+    RV=0 ; /bin/gunzip -qc < "${BACKUP_DIR}/${L0ts}.ngz" > L0.nbk 2>/dev/null || RV=$?
+    if [ $LEVEL -gt 0 -a $RV -eq 0 ] ; then
+	/bin/gunzip -qc < "${BACKUP_DIR}/${L1ts}.ngz" > L1.nbk 2>/dev/null || RV=$?
+    fi
+    if [ $LEVEL -eq 2 -a $RV -eq 0 ] ; then
+	/bin/gunzip -qc < "${BACKUP_DIR}/${L2ts}.ngz" > L2.nbk 2>/dev/null || RV=$?
+    fi
+    if [ $RV -ne 0 ] ; then
+	unset SR LEVEL L0ts L1ts L2ts BACKUPS RV
+	rm -f L[0-2].nbk 2>/dev/null
+	return 100
+    fi
+
+    # Создаём БД из распакованных бэкапов
+    fb_auth ; $NBACKUPCMD -R "$DATABASE_FILE" $BACKUPS >/dev/null 2>&1 && \
+	test -r "$DATABASE_FILE" && chmod 660 "$DATABASE_FILE" && \
+	chown firebird:firebird "$DATABASE_FILE" ; RV=$? ; fb_deauth
+    rm -f L[0-2].nbk 2>/dev/null
+    if [ $RV -ne 0 ] ; then
+	unset SR LEVEL L0ts L1ts L2ts BACKUPS
+	return $RV
+    fi
+    unset BACKUPS RV
+
+    # Если база была успешно восстановлена из сегодняшнего бэкапа, пытаемся
+    # обновить файл LAST, используя мета-данные задействованных .ngz архивов
+    #
+    if [ $NEED_REPLACE_DB -ne 0 ] ; then
+	update_last_info `echo "$SR" | /usr/bin/cut -f3 -d ' '`
+    fi
+    unset SR LEVEL L0ts L1ts L2ts
+    return 0
+}
+
+
+# Внутренняя функция для  restore_from_lpb().  Выполняет единственную
+# итерацию  восстановления  из  указанного   инкрементального  бэкапа,
+# если он рабочий, и если время модификации образа OLD.fdb не позднее
+# времени модификации этого бэкапа.
+#
+lpb_restore_iteration() {
+    OPTS=`echo "$DUMMY" | /usr/bin/$1 -n1`
+    BACKUP_DIR="${AUTOSAVEDIR}/"`echo "$OPTS" | /usr/bin/cut -f2 -d ' '`
+    BACKUP_FILE=`/usr/bin/basename "$BACKUP_DIR" .ngz 2>/dev/null`
+    test -r "$BACKUP_DIR" || return 99
+    if [ -n "$NTS" ] ; then
+	RV=`LANG=C /bin/date -r "$BACKUP_DIR" +%s 2>/dev/null`
+	if [ "$RV" -lt "$NTS" ] ; then
+	    BACKUP_DIR=`/usr/bin/dirname "$BACKUP_DIR" 2>/dev/null`
+	    USE_OLD_DBIMAGE=1
+	    unset RV
+	    return 0
+	fi
+	unset RV
+    fi
+    BACKUP_DIR=`/usr/bin/dirname "$BACKUP_DIR" 2>/dev/null`
+    restore_from_ngz "ReadOPTS"
+    return $?
+}
+
+
+# Пытается восстановить БД  из последнего  (или предпоследнего)
+# рабочего инкрементального бэкапа, либо из сохранённого образа
+# БД OLD.fdb, в зависимости от того, какой из этих файлов имеет
+# более позднюю метку времени.
+#
+restore_from_lpb() {
+    DUMMY=`/root/ic-search -l -v -LP 2>/dev/null \
+		| /usr/bin/tail -n2 | /usr/bin/tac`
+    LINES=`echo "$DUMMY" | /usr/bin/wc -l 2>/dev/null`
+    if [ "$LINES" != "1" -a "$LINES" != "2" ] ; then
+	unset DUMMY LINES ; return 98
+    fi
+    test -r OLD.fdb && NTS=`LANG=C /bin/date -r OLD.fdb +%s 2>/dev/null`
+    lpb_restore_iteration "head" ; RV=$?
+    if [ $RV -ne 0 -a "$LINES" = "2" ] ; then
+	lpb_restore_iteration "tail" ; RV=$?
+    fi
+    test $RV -ne 0 -a -n "$NTS" && USE_OLD_DBIMAGE=1
+    if [ $USE_OLD_DBIMAGE -ne 0 ] ; then
+	cp -af OLD.fdb "$DATABASE_FILE" 2>/dev/null ; RV=$?
+    fi
+    unset DUMMY LINES
+    return $RV
+}
+
+
+# Справка по использованию
+if [ -z "$1" -o "$1" = "-h" -o "$1" = "--help" ] ; then
+    echo "Использование: $0 -h
+         либо: $0 {[-p] | -r | <БазаДанных>} {-l | <Бэкап>}
+
+Всего параметорв может быть - один либо два, порядок - значения не имеет.
+Обо всех возможных параметрах очень коротко:
+
+ -h, --help     Показать данную инструкцию и выйти.
+ -p, --prepare  Подготовить образ БД \"RESTORED.fdb\" на TMPFS-разделе (этот
+                режим действует по умолчанию, когда указан только <Бэкап>).
+ -r, --replace  Заменить рабочую БД на TMPFS-разделе образом восстановленной
+                БД и перезапустить службу Firebird, если она была запущена
+                (замена БД и перезапуск службы выполняются только в случае
+                успешного восстановления БД из указанного бэкапа).
+ -l, --last     Использовать последний или предпоследний инкрементальный бэкап,
+                либо образ БД OLD.fdb из хранилища резервных копий (более новому
+                и рабочему отдаётся предпочтение).
+ <БазаДанных>   Полный или относительный путь к создаваемому файлу БД (\".fdb\").
+ <Бэкап>        Путь к существующему файлу полной (\".gbz\") либо инкрементальной
+                (\".ngz\") резервной копии БД, указываемый относительно директории
+                хранилища резервных копий.
+"
+    exit 0
+fi
+
+# Проверяем наличие обязательных утилит и службы Firebird
+test -x $GBAKCMD -a -x $NBACKUPCMD -a -x $FB_SERVICE || exit 2
+
+# Переходим в директорию бэкапов
+cd "$AUTOSAVEDIR" || exit 3
+
+# Разбираем командную строку
+OPT_DATABASE='' ; OPT_BACKUP=''
+while [ -n "$1" ]
+do
+    case "$1" in
+    -p|--prepare)
+	OPT_DATABASE=""
+	NEED_PREPARE_DB=1
+	NEED_REPLACE_DB=0
+	;;
+    -r|--replace)
+	OPT_DATABASE=""
+	NEED_REPLACE_DB=1
+	NEED_PREPARE_DB=0
+	;;
+    -l|--last)
+	OPTS=""
+	OPT_BACKUP=""
+	USE_LAST_BACKUP=1
+	USE_FULL_BACKUP=0
+	;;
+    *)
+	FIRST_CHAR=`echo "$1" | /usr/bin/cut -c1`
+	if [ "x$FIRST_CHAR" = "x-" ] ; then
+	    echo "Неожиданный параметр: '$1'"
+	    echo "Используйте '$0 -h' для получения справки"
+	    exit 4
+	fi
+	unset FIRST_CHAR
+	case "$1" in
+	*.fdb)
+	    OPT_DATABASE="$1"
+	    NEED_REPLACE_DB=0
+	    NEED_PREPARE_DB=0
+	    ;;
+	archive/2???-??.gbz)
+	    OPT_BACKUP="$1"
+	    USE_FULL_BACKUP=1
+	    USE_LAST_BACKUP=0
+	    P_FILE=`/usr/bin/basename "$1" .gbz 2>/dev/null`
+	    YYYY=`echo "$P_FILE" | /usr/bin/cut -f1 -d-`
+	    MM=`echo "$P_FILE" | /usr/bin/cut -f2 -d-`
+	    OPTS="-1 -v -A -Y $YYYY -M $MM"
+	    unset P_FILE YYYY MM
+	    ;;
+	2???-??/daily-??.gbz)
+	    OPT_BACKUP="$1"
+	    USE_FULL_BACKUP=1
+	    USE_LAST_BACKUP=0
+	    P_DIR=`/usr/bin/dirname "$1" 2>/dev/null`
+	    DD=`/usr/bin/basename "$1" .gbz 2>/dev/null | /usr/bin/cut -f2 -d-`
+	    YYYY=`echo "$P_DIR" | /usr/bin/cut -f1 -d-`
+	    MM=`echo "$P_DIR" | /usr/bin/cut -f2 -d-`
+	    OPTS="-1 -v -F -Y $YYYY -M $MM -D $DD"
+	    unset P_DIR YYYY MM DD
+	    ;;
+	[MTWFS]??/[0-2]???.ngz)
+	    OPT_BACKUP="$1"
+	    USE_FULL_BACKUP=0
+	    USE_LAST_BACKUP=0
+	    WDAY=`/usr/bin/dirname "$1" 2>/dev/null`
+	    P_FILE=`/usr/bin/basename "$1" .ngz 2>/dev/null`
+	    HH=`echo "$P_FILE" | /usr/bin/cut -c1-2`
+	    MM=`echo "$P_FILE" | /usr/bin/cut -c3-4`
+	    OPTS="-l -v -L2 -W $WDAY -H $HH -m $MM"
+	    unset P_FILE WDAY HH MM
+	    ;;
+	*)
+	    echo "Неожиданный параметр либо ошибочное имя файла: '$1'"
+	    echo "Используйте '$0 -h' для получения справки"
+	    exit 4
+	    ;;
+	esac
+	;;
+    esac
+    shift
+done
+
+# Проверяем допустимость имени файла восстанавливаемой БД
+if [ $NEED_PREPARE_DB -ne 0 -o $NEED_REPLACE_DB -ne 0 ] ; then
+    DATABASE_FILE="${WORKDIR}/RESTORED.fdb"
+elif [ -z "$OPT_DATABASE" ] ; then
+    echo "Файл <БазыДанных> не указан"
+    echo "Используйте '$0 -h' для получения справки"
+    exit 5
+elif [ "$OPT_DATABASE" = "$TMPDATABASE" ] ; then
+    echo "В качестве БД нельзя указывать текущую рабочую базу ($TMPDATABASE)"
+    exit 5
+elif [ "$OPT_DATABASE" = "OLD.fdb" -o "$OPT_DATABASE" = "${AUTOSAVEDIR}/OLD.fdb" ] ; then
+    echo "В качестве БД нельзя указывать предыдущую рабочую базу (OLD.fdb)"
+    exit 5
+elif [ "$OPT_DATABASE" = "TMP.fdb" -o "$OPT_DATABASE" = "${AUTOSAVEDIR}/TMP.fdb" ] ; then
+    echo "В качестве БД нельзя указывать временный файл базы (TMP.fdb)"
+    exit 5
+else
+    DATABASE_FILE="$OPT_DATABASE"
+fi
+
+# Директория, куда будет сохраняться БД, должна существовать
+DATABASE_DIR=`/usr/bin/dirname "$DATABASE_FILE" 2>/dev/null`
+if [ "$DATABASE_DIR" = "." ] ; then
+    DATABASE_FILE="${AUTOSAVEDIR}/${DATABASE_FILE}"
+    DATABASE_DIR="$AUTOSAVEDIR"
+fi
+if [ ! -d "$DATABASE_DIR" ] ; then
+    echo "Невозможно создать БД по указанному пути (${DATABASE_DIR})"
+    exit 6
+fi
+
+# Проверяем наличие бэкапа
+if [ -n "$OPT_BACKUP" ] ; then
+    if [ -r "$OPT_BACKUP" ] ; then
+	if [ $USE_FULL_BACKUP -ne 0 ] ; then
+	    BACKUP_FILE=`/usr/bin/basename "$OPT_BACKUP" .gbz 2>/dev/null`
+	else
+	    BACKUP_FILE=`/usr/bin/basename "$OPT_BACKUP" .ngz 2>/dev/null`
+	fi
+	BACKUP_DIR="${AUTOSAVEDIR}/"`/usr/bin/dirname "$OPT_BACKUP" 2>/dev/null`
+    else
+	echo "Указанный <Бэкап> ('$OPT_BACKUP') не обнаружен"
+	echo "Используйте '$0 -h' для получения справки"
+	exit 7
+    fi
+elif [ $USE_LAST_BACKUP -eq 0 ] ; then
+    echo "Обязательный файл <Бэкапа> не указан"
+    echo "Используйте '$0 -h' для получения справки"
+    exit 8
+fi
+
+# Определяем необходимость блокировки рабочего каталога и перезапуска службы Firebird
+if [ $NEED_REPLACE_DB -ne 0 ] ; then
+    if [ ! -d "$WORKDIR" ] ; then
+	echo "Директория рабочей БД не найдена"
+	exit 9
+    fi
+    fb_svc status && NEED_RESTART_FB=1
+fi
+if [ $NEED_REPLACE_DB -ne 0 -o $USE_FULL_BACKUP -eq 0 ] ; then
+    fb_svc status && wait_lock_workdir
+fi
+
+# При восстановлении через утилиту GBAK, Firebird д.б. запущен
+if [ $USE_FULL_BACKUP -ne 0 ] ; then
+    if ! fb_svc status ; then
+	fb_svc start ; /bin/sleep 2
+	if ! fb_svc status ; then
+	    echo "Для восстановления из полного бэкапа, служба Firebird"
+	    echo "д.б. запущена, однако запустить эту службу не удалось"
+	    unlock_workdir
+	    exit 10
+	fi
+	NEED_STOP_FB=1
+    fi
+fi
+unset OPT_DATABASE OPT_BACKUP NEED_PREPARE_DB DATABASE_DIR
+
+# Отладка
+if /bin/false ; then
+    echo "NEED_STOP_FB:     $NEED_STOP_FB" >&2
+    echo "NEED_RESTART_FB:  $NEED_RESTART_FB" >&2
+    echo "NEED_REPLACE_DB:  $NEED_REPLACE_DB" >&2
+    echo "USE_LAST_BACKUP:  $USE_LAST_BACKUP" >&2
+    echo "USE_FULL_BACKUP:  $USE_FULL_BACKUP" >&2
+    echo "DATABASE_FILE     '$DATABASE_FILE'" >&2
+    echo "BACKUP_FILE:      '$BACKUP_FILE'" >&2
+    echo "BACKUP_DIR:       '$BACKUP_DIR'" >&2
+    echo "OPTS:             '$OPTS'" >&2
+    unlock_workdir
+    exit 0
+fi
+
+# Выбираем алгоритм восстановления
+rm -f "$DATABASE_FILE" 2>/dev/null
+if [ $USE_FULL_BACKUP -ne 0 ] ; then
+    restore_from_gbz ; RV=$?
+elif [ $USE_LAST_BACKUP -eq 0 ] ; then
+    restore_from_ngz ; RV=$?
+else
+    restore_from_lpb ; RV=$?
+fi
+if [ $NEED_STOP_FB -ne 0 ] ; then
+    fb_svc stop || fb_svc stop ; /bin/sleep 2
+fi
+if [ $RV -ne 0 ] ; then
+    rm -f "$DATABASE_FILE" 2>/dev/null
+    echo "При восстановлении из указанного бэкапа возникла ошибка #${RV}"
+else
+    if [ $NEED_RESTART_FB -ne 0 ] ; then
+	fb_svc stop || fb_svc stop ; /bin/sleep 2
+    fi
+    if [ $NEED_REPLACE_DB -ne 0 ] ; then
+	if [ $USE_OLD_DBIMAGE -eq 0 -a -r $TMPDATABASE ]
+	then
+	    cp -af $TMPDATABASE TMP.fdb 2>/dev/null && \
+		chown 0:0 TMP.fdb && chmod 600 TMP.fdb && \
+		/bin/sync && mv -f TMP.fdb OLD.fdb || RV=11
+	    rm -f TMP.fdb 2>/dev/null
+	fi
+	rm -f $LASTMODFILE 2>/dev/null
+	if [ $RV -eq 0 ] ; then
+	    mv -f "$DATABASE_FILE" $TMPDATABASE || RV=12
+	    rm -f "$DATABASE_FILE" 2>/dev/null
+	fi
+	if [ $RV -eq 0 ] ; then
+	    test -r $FB_LASTFILE && mv -f $FB_LASTFILE $FB_PREVFILE
+	    test -n "$LASTINFO" && umask 0077 && echo -n "$LASTINFO" > $FB_LASTFILE
+	    RV="Database restored from the"
+	    if [ $USE_FULL_BACKUP -ne 0 ] ; then
+		RV="$RV full backup (${BACKUP_DIR}/${BACKUP_FILE}.gbz)"
+	    elif [ $USE_OLD_DBIMAGE -ne 0 ] ; then
+		RV="$RV last saved image (${AUTOSAVEDIR}/OLD.fdb)"
+	    else
+		RV="$RV backup (${BACKUP_DIR}/${BACKUP_FILE}.ngz)"
+	    fi
+	    if [ ! -r restore.log ] ; then
+		umask 0077 ; echo -n "" > restore.log
+	    fi
+	    /usr/bin/logger -t ic-restore -p daemon.alert "$RV"
+	    echo "["`LANG=C /bin/date`"] "`hostname`": $RV" >> restore.log
+	    echo "$RV" ; RV=0
+	fi
+    fi
+    if [ $NEED_RESTART_FB -ne 0 ] ; then
+	fb_svc start ; /bin/sleep 2
+    fi
+    if [ $NEED_REPLACE_DB -ne 0 -a -r $TMPDATABASE ] ; then
+	CURR_FILE_TIME=`LANG=C /bin/date -r $TMPDATABASE +%s 2>/dev/null`
+	umask 0077 ; echo -n "$CURR_FILE_TIME" > $LASTMODFILE
+	unset CURR_FILE_TIME
+    fi
+fi
+
+unlock_workdir
+exit $RV

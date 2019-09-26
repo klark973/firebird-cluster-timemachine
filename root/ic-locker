@@ -1,0 +1,121 @@
+#!/bin/sh
+
+# Блокиратор БД "Инфоклиника" (подключаемый не исполняемый файл)
+# v.0.9.05112014
+#
+# Используется различными скриптами для блокирования и разблоки-
+# рования  повторного запуска  с единственной целью:  обеспечить
+# работу с данными не более,  чем одному сценарию  единовременно.
+# Под "данными"  здесь  подразумевается БД "Инфоклиника" и соот-
+# ветствующие резервные копии.  Кроме того,  здесь же содержатся
+# другие общие определения переменных и кодовой базы.
+#
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) 2014 Leonid Krivoshein <klark.devel@gmail.com>
+#
+
+# Пути к обязательным утилитам
+NBACKUPCMD="/usr/bin/nbackup"
+ISQLCMD="/usr/bin/isql-fb"
+GBAKCMD="/usr/bin/gbak"
+GFIXCMD="/usr/bin/gfix"
+
+# Константы
+WORKDIR="/tmp/fb-database"
+AUTOSAVEDIR="/home/firebird"
+FB_LASTFILE="${AUTOSAVEDIR}/LAST"
+FB_PREVFILE="${AUTOSAVEDIR}/PREV"
+TMPLOCKFILE="${WORKDIR}/DIRLOCKED"
+TMPDATABASE="${WORKDIR}/DATABASE.fdb"
+LASTMODFILE="${WORKDIR}/DATABASE.touch"
+FB_SERVICE="/etc/init.d/firebird2.5-super"
+FB_DATABASE_SERVICE="${WORKDIR}/DATABASE.service"
+FB_AUTHFILE="/etc/firebird/2.5/SYSDBA.password"
+
+# Подключаем и сохраняем данные аутентификации
+test -r $FB_AUTHFILE && . $FB_AUTHFILE
+test -n "$ISC_USER" || ISC_USER="sysdba"
+test -n "$ISC_PASSWORD" || exit 2
+SAVED_ISC_PASS="$ISC_PASSWORD"
+SAVED_ISC_USER="$ISC_USER"
+export ISC_PASSWORD=""
+unset ISC_PASSWORD
+export ISC_USER=""
+unset ISC_USER
+
+
+# Переносит данные аутентификации в текущее окружение
+fb_auth() {
+    export ISC_PASSWORD="$SAVED_ISC_PASS"
+    export ISC_USER="$SAVED_ISC_USER"
+    return 0
+}
+
+# Удаляет данные аутентификации из текущего окружения
+fb_deauth() {
+    export ISC_PASSWORD=""
+    unset ISC_PASSWORD
+    export ISC_USER=""
+    unset ISC_USER
+    return 0
+}
+
+# Безмолвно выполняет запрошенное действие ($1) со службой Firebird
+fb_svc() {
+    $FB_SERVICE $1 >/dev/null 2>&1 ; RETVAL=$?
+    if [ x"$1" = x"stop" -a $RETVAL -eq 0 ] ; then
+	/bin/sleep 5 ; rm -rf /tmp/firebird 2>/dev/null
+    fi
+    return $RETVAL
+}
+
+# Возвращает 0 (ИСТИНУ), если блокировка уже была установлена
+is_workdir_locked() {
+    test -r "$TMPLOCKFILE"
+    return $?
+}
+
+# Пытается заблокировать и в случае успеха возвращает 0 (ИСТИНУ)
+try_lock_workdir() {
+    test -r "$TMPLOCKFILE" && return 1
+    echo -n "$$" > "$TMPLOCKFILE"
+    /bin/sleep 1
+    test "x$$" = "x"`cat "$TMPLOCKFILE" 2>/dev/null`
+    return $?
+}
+
+# Блокирует, дождавшись снятия блокировки другим процессом
+wait_lock_workdir() {
+    try_lock_workdir && return 0
+    /bin/sleep 5
+    try_lock_workdir && return 0
+    /bin/sleep 5
+    try_lock_workdir && return 0
+    while /bin/true ; do
+	/bin/sleep 30
+	try_lock_workdir && return 0
+    done
+}
+
+# Безмолвно разблокирует (снимает блокировку)
+unlock_workdir() {
+    test -r "$TMPLOCKFILE" || return 1
+    if [ "x$$" = "x"`cat "$TMPLOCKFILE" 2>/dev/null` ] ; then
+	rm -f "$TMPLOCKFILE" 2>/dev/null
+	return $?
+    fi
+    return 2
+}
+

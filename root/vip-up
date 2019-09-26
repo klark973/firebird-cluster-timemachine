@@ -1,0 +1,54 @@
+#!/bin/sh
+
+# Скрипт, поднимающий виртуальный кластерный IP   v.0.9.02112014
+#
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) 2014 Leonid Krivoshein <klark.devel@gmail.com>
+#
+
+on_exit() {
+    TH=`/bin/hostname 2>/dev/null`
+    (	echo "$TH принимает роль ведущего узла кластера:"
+	echo "" ; cat "$REPORT" ; echo ""
+	if [ -r /var/log/daemon.log ]
+	then
+	    echo "/var/log/daemon.log tail:"
+	    /usr/bin/tail -n20 /var/log/daemon.log
+	    echo ""
+	fi
+	/root/whac
+    ) | /root/alert-admin
+    rm -f "$REPORT"
+}
+
+test -n "$1" -a -n "$2" || exit 250
+REPORT="/tmp/$1-vip-up.report"
+trap on_exit EXIT
+(
+    if ! /sbin/drbdadm primary all
+    then
+	/sbin/drbdadm disconnect all
+	/sbin/drbdadm primary all || exit $?
+    fi
+    if ! /bin/mount /home
+    then
+	/sbin/fsck.jfs -pf /dev/drbd0
+	/bin/mount /home || exit $?
+    fi
+    /sbin/ifup $1:ucarp || exit $?
+    /root/ic-cluster start || exit $?
+) > "$REPORT" 2>&1
+
+exit 0

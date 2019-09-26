@@ -1,0 +1,219 @@
+#!/bin/sh
+
+# /root/ic-cluster init script           v.0.8.11112014
+#
+# This file belongs in /etc/init.d where it will be run
+# on system startup and shutdown to start the
+# Firebird database server daemon
+#
+
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) Firebird project, http://www.firebirdsql.org/
+# Copyright (C) 2014 Leonid Krivoshein <klark.devel@gmail.com>
+#
+
+
+# This init script contains functions specific for debian
+# init scripts.
+
+### BEGIN INIT INFO
+# Provides:          ic-cluster
+# Required-Start:    $remote_fs $syslog $named
+# Required-Stop:     $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Start firebird super-server
+# Description:       Start the firebird guardian process (fbguard)
+#                    which starts the actual firebird server process
+#                    (fbserver) and makes sure there is always fbserver
+#                    running
+### END INIT INFO
+
+
+# Source LSB function library
+. /lib/lsb/init-functions
+
+# TMPFS work directory locker
+test -r /root/ic-locker || exit 1
+. /root/ic-locker
+
+set -u
+FB_VER="2.5"
+export FB_VER
+FB_FLAVOUR="super"
+FBRunUser="firebird"
+FBGUARD="/usr/sbin/fbguard"
+FBSERVER="/usr/sbin/fbserver"
+RUNDIR="/var/run/firebird/$FB_VER"
+PIDFILE="${RUNDIR}/fbserver.pid"
+NAME="Firebird $FB_VER $FB_FLAVOUR server"
+FB_OPTS="-daemon -forever -pidfile $PIDFILE"
+
+# Check the guardian and ic-restore is there and is executable
+test -x $FBGUARD -a -x $FBSERVER -a -x /root/ic-restore || exit 1
+
+# Check to see if server is enabled (disabled by default)
+ENABLE_FIREBIRD_SERVER="no"
+DEFAULT="/etc/default/firebird${FB_VER}"
+test -r "$DEFAULT" && . "$DEFAULT"
+
+# workaround of splashy's #400598
+# define RUNLEVEL to avoind unbound variable error
+RUNLEVEL=${RUNLEVEL:-}
+
+
+# Return 0 (TRUE), if firebird daemon already running
+is_fb_running() {
+    /bin/pidof $FBGUARD >/dev/null 2>&1 ; return $?
+}
+
+# Try to start firebird daemon and auto-save service
+try_fb_start() {
+    cd "$AUTOSAVEDIR" || return $?
+    mkdir -p $WORKDIR 2>/dev/null && chmod 770 $WORKDIR && \
+	chown ${FBRunUser}:${FBRunUser} $WORKDIR || return $? ; RV=0
+    if [ -r DATABASE.fdb ] ; then
+	cp -af DATABASE.fdb $TMPDATABASE 2>/dev/null && \
+	chown ${FBRunUser}:${FBRunUser} $TMPDATABASE && \
+	chmod 660 $TMPDATABASE && mv -f DATABASE.fdb OLD.fdb || RV=$?
+	if [ $RV -eq 0 ] ; then
+	    /usr/bin/logger -t ic-cluster -p daemon.info \
+		"Using last saved database image (DATABASE.fdb)"
+	fi
+    else
+	/root/ic-restore -r -l >/dev/null 2>&1 || RV=$?
+	if [ $RV -eq 0 ] ; then
+	    cp -af $TMPDATABASE TMP.fdb 2>/dev/null && \
+	    chmod 600 TMP.fdb && chown 0:0 TMP.fdb && \
+	    /bin/sync && mv -f TMP.fdb OLD.fdb || RV=$?
+	fi
+    fi
+    if [ $RV -ne 0 ] ; then
+	rm -f $TMPDATABASE TMP.fdb 2>/dev/null
+	return $RV
+    fi
+    RV=`LANG=C /bin/date -r $TMPDATABASE +%s 2>/dev/null`
+    echo -n "$RV" > $LASTMODFILE ; unset RV
+    chmod 600 $LASTMODFILE
+    if [ ! -d "$RUNDIR" ] ; then
+	mkdir -p "$RUNDIR" 2>/dev/null && chmod 770 "$RUNDIR" && \
+	    chown ${FBRunUser}:${FBRunUser} "$RUNDIR" || return $?
+    fi
+    cd / ; rm -f $PIDFILE 2>/dev/null
+    /sbin/start-stop-daemon --start --quiet --chuid $FBRunUser \
+	--pidfile $PIDFILE --exec $FBGUARD -- $FB_OPTS >/dev/null \
+	2>&1 && /bin/sleep 1 && is_fb_running
+    return $?
+}
+
+# Try to stop firebird daemon only
+try_stop_daemon() {
+    /sbin/start-stop-daemon --stop --quiet --oknodo --retry 10 \
+	--exec $FBGUARD >/dev/null 2>&1 || return $?
+    /sbin/start-stop-daemon --stop --quiet --oknodo --retry 15 \
+	--exec $FBSERVER --pidfile $PIDFILE >/dev/null 2>&1
+    return $?
+}
+
+# Try to stop firebird daemon and auto-save service
+try_fb_stop() {
+    try_stop_daemon || return $?
+    if [ -r $TMPDATABASE ] ; then
+	cd "$AUTOSAVEDIR" && cp -af $TMPDATABASE TMP.fdb && \
+	chmod 600 TMP.fdb && chown 0:0 TMP.fdb && /bin/sync && \
+	mv -f TMP.fdb DATABASE.fdb || return $?
+	/usr/bin/logger -t ic-cluster -p daemon.info \
+		    "Database image (DATABASE.fdb) saved"
+    fi
+    return 0
+}
+
+# Clear firebird directories
+clear_fb_dirs() {
+    test -n "$WORKDIR" -a -d "$WORKDIR" && rm -rf "$WORKDIR" 2>/dev/null
+    test -n "$RUNDIR" -a -d "$RUNDIR" && rm -rf "$RUNDIR" 2>/dev/null
+    test -d /tmp/firebird && rm -rf /tmp/firebird 2>/dev/null
+    return 0
+}
+
+# See how we were called
+case "$1" in
+start)
+    if [ "$ENABLE_FIREBIRD_SERVER" != "yes" ] ; then
+	log_warning_msg "Not starting $NAME"
+	log_warning_msg "Use 'dpkg-reconfigure firebird${FB_VER}-${FB_FLAVOUR}' to enable"
+	RETVAL=0
+    elif [ -r $TMPDATABASE ] && is_fb_running ; then
+	log_success_msg "$NAME already running"
+	if [ ! -r $FB_DATABASE_SERVICE ] ; then
+	    echo -n "`LANG=C /bin/date 2>/dev/null`" > $FB_DATABASE_SERVICE
+	    chmod 600 $FB_DATABASE_SERVICE
+	fi
+	RETVAL=0
+    else
+	log_action_begin_msg "Starting $NAME"
+	rm -f $FB_DATABASE_SERVICE 2>/dev/null
+	is_fb_running && try_stop_daemon
+	clear_fb_dirs ; try_fb_start ; RETVAL=$? ; cd /
+	if [ $RETVAL -eq 0 ] ; then
+	    echo -n "`LANG=C /bin/date 2>/dev/null`" > $FB_DATABASE_SERVICE
+	    chmod 600 $FB_DATABASE_SERVICE
+	elif is_fb_running ; then
+	    try_stop_daemon && clear_fb_dirs
+	else
+	    clear_fb_dirs
+	fi
+	log_action_end_msg $RETVAL
+    fi
+    ;;
+
+stop)
+    rm -f $FB_DATABASE_SERVICE 2>/dev/null
+    if is_fb_running ; then
+	log_action_begin_msg "Stopping $NAME"
+	test -d "$WORKDIR" && wait_lock_workdir
+	try_fb_stop ; RETVAL=$?
+	log_action_end_msg $RETVAL
+    elif [ -r $TMPDATABASE ] ; then
+	log_action_begin_msg "Stopping $NAME"
+	test -d "$WORKDIR" && wait_lock_workdir
+	log_action_end_msg 0 ; RETVAL=0
+    else
+	log_success_msg "$NAME not running"
+	RETVAL=0
+    fi
+    clear_fb_dirs
+    ;;
+
+restart|force-reload)
+    $0 stop && $0 start
+    RETVAL=$?
+    ;;
+
+status)
+    test -r $TMPDATABASE && is_fb_running ; RETVAL=$?
+    if [ $RETVAL -eq 0 -a ! -r $FB_DATABASE_SERVICE ] ; then
+	echo -n "`LANG=C /bin/date 2>/dev/null`" > $FB_DATABASE_SERVICE
+	chmod 600 $FB_DATABASE_SERVICE
+    fi
+    ;;
+
+*)
+    echo "Usage: $0 {start|stop|restart|force-reload|status}"
+    RETVAL=2
+    ;;
+esac
+
+exit $RETVAL

@@ -1,0 +1,63 @@
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+#
+# ====================================================
+# КЛАСТЕРНАЯ КОНФИГУРАЦИЯ node1 (LACP 802.3ad + UCARP)
+# ====================================================
+#
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+# The primary network interface
+auto bond0 eth0 eth1
+iface bond0 inet static
+	address 10.0.0.7
+	network 10.0.0.0
+	netmask 255.255.255.0
+	gateway 10.0.0.254
+	broadcast 10.0.0.255
+
+	# Определяем объединяемые интерфейсы
+	bond-slaves eth0 eth1
+
+	# Определяем тип агрегации каналов, например, см.:
+	# http://www.k-max.name/linux/teaming-bonding-na-debian-linux/
+	# bond-mode balance-rr
+	#
+	bond-mode 802.3ad
+
+	# Интервал проверки линии в миллисекундах
+	bond-miimon 100
+
+	# Задержка перед установкой соединения в миллисекундах
+	bond-downdelay 200
+
+	# Задержка перед обрывом соединения в миллисекундах
+	bond-updelay 200
+
+	# Опции dns-* обеспечиваются пакетом resolvconf
+	dns-search corp.example.com
+	dns-nameservers 10.0.0.1
+
+	# Опции UCARP
+	ucarp-vid 3
+	ucarp-vip 10.0.0.9
+	ucarp-password MegaSecretString
+	ucarp-deadratio 5
+	ucarp-master no
+	ucarp-advskew 0
+	ucarp-nomcast 1
+	ucarp-upscript /root/vip-up
+	ucarp-downscript /root/vip-down
+
+iface bond0:ucarp inet static
+	address 10.0.0.9
+	netmask 255.255.255.0
+
+# Для проверки работы агрегации портов:
+# ls -la /proc/net/bonding/
+# cat /proc/net/bonding/bond0
+# cat /sys/class/net/bond0/bonding/mode
+# ifconfig

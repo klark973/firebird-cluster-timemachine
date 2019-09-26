@@ -1,0 +1,66 @@
+#!/bin/sh
+
+# Скрипт определения рабочих и выходных дней.
+# Нижеперечисленные даты соответствуют 2017г.
+#
+
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) 2017 Leonid Krivoshein <klark.devel@gmail.com>
+#
+
+# Официальные рабочие даты, совпадающие с выходными
+w_dates=
+
+# Официальные праздничные даты, совпадающие с буднями
+h_dates="02.01 03.01 04.01 05.01 06.01 23.02 24.02 08.03 01.05 08.05 09.05 12.06 06.11"
+
+
+# Возвращает 0, если в первом параметре указана нерабочая дата года (в формате DD.MM)
+is_holyday() {
+    testdate="$1"
+    if [ -z "$testdate" ] ; then
+	testdate=`LANG=C /bin/date +%d.%m`
+    fi
+    yearNOW=`LANG=C /bin/date +%Y`
+    testDOM=`echo "$testdate" | /usr/bin/cut -f1 -d.`
+    testMON=`echo "$testdate" | /usr/bin/cut -f2 -d.`
+    tts="${testMON}/${testDOM}/${yearNOW}"
+    wday=`LANG=C /bin/date -d $tts +%u`
+    if [ $wday -le 5 ] ; then
+	for dom in $h_dates ; do
+	    if [ "$dom" = "$testdate" ] ; then
+		unset testdate yearNOW testDOM testMON tts wday dom
+		return 0
+	    fi
+	done
+	unset testdate yearNOW testDOM testMON tts wday dom
+	return 1
+    fi
+    for dom in $w_dates ; do
+	if [ "$dom" = "$testdate" ] ; then
+	    unset testdate yearNOW testDOM testMON tts wday dom
+	    return 1
+	fi
+    done
+    unset testdate yearNOW testDOM testMON tts wday dom
+    return 0
+}
+
+
+# Возвращает 0, если в первом параметре указана рабочая дата года (в формате DD.MM)
+is_workday() {
+    is_holyday "$1" && return 1 || return 0
+}
+

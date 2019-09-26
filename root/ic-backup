@@ -1,0 +1,870 @@
+#!/bin/sh
+
+# Скрипт автосохранения рабочей БД "Инфоклиника"  v.0.9.23112014
+#
+# Периодически (по крону) выполняет автосохранение на физические
+# диски кластера "снимки" рабочей БД "Инфоклиника",  находящейся
+# на TMPFS-разделе,  т.е. работет подобно функции автосохранения
+# текстового редактора.  Данный скрипт является автоматизирующей
+# оболочкой над утилитами резервного копирования  GBAK и NBACKUP
+# из пакета СУБД Firebird.
+#
+# Данная программа  является  свободным программным обеспечением.
+# Вы можете  распространять  и/или  модифицировать  её  согласно
+# условиям Стандартной Общественной Лицензии GNU, опубликованной
+# Фондом Свободного Программного Обеспечения,  версии 3 или,  по
+# Вашему желанию,  любой  более поздней  версии.  Эта  программа
+# распространяется в надежде,  что она будет полезной,  но  БЕЗО
+# ВСЯКИХ  ГАРАНТИЙ,  в  том  числе,   подразумеваемых   гарантий
+# ТОВАРНОГО СОСТОЯНИЯ ПРИ ПРОДАЖЕ  и  ГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОГО
+# ПРИМЕНЕНИЯ. Смотрите Стандартную Общественную Лицензию GNU для
+# получения  дополнительной  информации.    Копия  оригинального
+# текста  Стандартной  Общественной  Лицензии  GNU  поставляется
+# вместе с этой программой в файле LICENSE.
+#
+# Copyright (C) 2014 Leonid Krivoshein <klark.devel@gmail.com>
+#
+
+# Засекаем время начала выполнения задания
+STARTUP=`LANG=C /bin/date +%Y%m%d%H%M%a 2>/dev/null`
+TS0=`LANG=C /bin/date +%s 2>/dev/null`
+
+# Обычному пользователю этот скрипт недоступен
+test "x"`/usr/bin/id -u 2>/dev/null` = "x0" || exit 1
+
+# Подключаем блокиратор БД с общими определениями
+test -r /root/ic-locker || exit 1
+. /root/ic-locker
+
+# Подключаем определение корпоративных рабочих суток
+test -r /root/corporate || exit 1
+. /root/corporate
+
+# Определяем дополнительные константы
+BKEXT=".ngz"
+METAEXT=".meta"
+ALERTDIR="/var/run/ic-backup"
+TMPOLDBASE="${WORKDIR}/OLD.fdb"
+TMPQTESTDB="${WORKDIR}/current-test.fdb"
+TMPDAILY="${AUTOSAVEDIR}/current-backup.fbk"
+TMPSHADOW="${AUTOSAVEDIR}/current-shadow.fdb"
+TMPTESTBASE="${AUTOSAVEDIR}/current-test.fdb"
+TMPBACKUP="${AUTOSAVEDIR}/current-backup${BKEXT}"
+
+# Разбираем время запуска на части
+YEAR=`echo "$STARTUP" | /usr/bin/cut -c1-4`
+MONTH=`echo "$STARTUP" | /usr/bin/cut -c5-6`
+TODAY=`echo "$STARTUP" | /usr/bin/cut -c7-8`
+HOURS=`echo "$STARTUP" | /usr/bin/cut -c9-10`
+MINUTES=`echo "$STARTUP" | /usr/bin/cut -c11-12`
+WEEKDAY=`echo "$STARTUP" | /usr/bin/cut -c13-15`
+FULLDATE="${YEAR}-${MONTH}-${TODAY}"
+
+# Начальный путь к файлам создаваемой дельты (nbackup)
+DELTABASE="${AUTOSAVEDIR}/${WEEKDAY}/${HOURS}${MINUTES}"
+
+# Начальный путь к полным бэкапам за текущий месяц
+MONTHLYBASE="${AUTOSAVEDIR}/${YEAR}-${MONTH}"
+
+# Полный бэкап на начало текущего дня (gbak)
+DAILYFULL="${MONTHLYBASE}/daily-${TODAY}.gbz"
+
+# Сохраняем название рабочего хоста
+THISHOST=`/bin/hostname 2>/dev/null`
+
+# Уведомление администратору о запуске слишком длинной операции
+# в неподходящее (в рабочее) время компании ещё не отправлялось
+#
+WARN_WORK_TIME=0
+
+# Набор основных реквизитов инкрементальных бэкапов предыдущих
+# уровней (в отношении создаваемого инкрементального бэкапа)
+#
+PREVBACKUPS=""
+
+
+# Записывает указанное событие в системный журнал
+errlog() {
+    MSG="Run-time error #$1: Date=${FULLDATE} Time=${HOURS}:${MINUTES}"
+    test -z "$2" || MSG="$MSG Status=$2"
+    /usr/bin/logger -t ic-backup -p daemon.alert "$MSG" >/dev/null 2>&1
+    unset MSG
+    return 0
+}
+
+
+# Уведомляет администратора о возникшей ошибке
+alert_admin() {
+    errlog $1 $2
+
+    # При наличии системы оповещения, включаем её
+    test -x /root/alert-admin || return 0
+
+    # Убеждаемся, что сообщение с таким же
+    # кодом ещё не отправлялось администратору
+    #
+    if [ ! -d $ALERTDIR ] ; then
+	mkdir -p $ALERTDIR 2>/dev/null
+    fi
+    test -r "${ALERTDIR}/$1.msg" && return 0
+
+    MSG="Ошибка выполнения скрипта $0 #$1,
+запущенного $FULLDATE в ${HOURS}:${MINUTES},
+пока не имеет подробного описания. Смотрите
+исходник скрипта для выяснения деталей..."
+    case $1 in
+
+    3)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES},
+не удалось заблокировать рабочий каталог '${WORKDIR}'.
+
+Наиболее  вероятная причина сбоя:  данный скрипт  был  запущен
+повторно, предыдущий запуск ещё не завершил выполнение задания.
+Возможно,  сервер сейчас  слишком сильно перегружен.  Возможно,
+создаётся полный бэкап либо диффиренциальный бэкап 0-го уровня
+в рабочее время клиники, чего в норме быть не должно.
+
+Если ничего такого сейчас не запущено, достаточно удалить файл
+'${TMPLOCKFILE}', после чего автосохранение возобновится
+в обычном режиме. На активном узле кластера автосохранение должно
+работать постоянно." ;;
+
+    20)
+	MSG="Скрипт $0 был запущен $FULLDATE в ${HOURS}:${MINUTES},
+т.е. в рабочее время клиники, при этом, ему пришлось выполнять
+слишком длинную операцию - создание полного суточного бэкапа либо
+инкрементального бэкапа 0-го уровня, чего в норме быть не должно.
+Настоящее сообщение является предупреждением." ;;
+
+    21)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, не удалось
+остановить службу Firebird. Полный бэкап БД без этого создать
+невозможно и никакие другие бэкапы без этого также не будут
+создаваться. Фактически это означает, что БД теперь находится
+исключительно в оперативной памяти сервера и в любой момент
+может оказаться утерянной. Ситуация критическая, принимайте
+срочные меры." ;;
+
+    22)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, при создании
+копии образа рабочей БД возникла неисправимая ошибка (RV=$2).
+Служба Firebird остаётся запущенной, однако полный бэкап БД
+без этого создать невозможно и никакие другие бэкапы без этого
+также не будут создаваться. Фактически это означает, что БД
+теперь находится исключительно в оперативной памяти сервера
+и в любой момент может оказаться утерянной. Ситуация очень
+критическая, принимайте срочные меры." ;;
+
+    23)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, при создании
+копии образа рабочей БД возникла неисправимая ошибка (RV=$2).
+Служба Firebird была остановлена, а перезапустить её не
+получается, полный бэкап БД создать невозможно и никакие
+другие бэкапы без этого также не будут создаваться.
+
+Фактически это означает, что база данных теперь находится
+исключительно в оперативной памяти сервера, пользователи
+не имеют к ней доступа, и в любой момент БД может оказаться
+полностью утерянной. Ситуация очень критическая, принимайте
+срочные меры." ;;
+
+    24)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, при выгрузке данных
+GBAK'ом из копии образа рабочей БД возникла неисправимая ошибка
+(RV=$2). Служба Firebird остаётся запущенной, пользователи могут
+продолжать обращаться к данным, однако полный бэкап БД создать
+невозможно и никакие другие бэкапы без этого также не будут
+создаваться.
+
+Фактически это означает, что база данных теперь находится
+исключительно в оперативной памяти сервера и в любой момент
+может оказаться полностью утерянной. Ситуация критическая,
+принимайте срочные меры." ;;
+
+    25)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, при попытке создать
+GBAK'ом новую БД из ранее созданной копии, возникла неисправимая
+ошибка (RV=$2). Служба Firebird остаётся запущенной, пользователи
+могут продолжать обращаться к данным, однако полноценный бэкап БД
+создать невозможно и никакие другие бэкапы без этого также не будут
+создаваться.
+
+Фактически это означает, что база данных теперь находится
+исключительно в оперативной памяти сервера и в любой момент
+может оказаться полностью утерянной. Ситуация критическая,
+принимайте срочные меры." ;;
+
+    26)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, не удалось повторно
+остановить службу Firebird. Полный бэкап БД без этого создать
+невозможно и никакие другие бэкапы без этого также не будут
+создаваться. Фактически это означает, что БД теперь находится
+исключительно в оперативной памяти сервера и в любой момент
+может оказаться утерянной. Ситуация критическая, принимайте
+срочные меры." ;;
+
+    27)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, при попытке заменить
+текущую рабочую базу данных вновь созданной GBAK'ом из резервной
+копии тестовой базой, возникла неисправимая ошибка (RV=$2). Служба
+Firebird остаётся запущенной, пользователи могут продолжать работать
+с предыдущей (вчерашней) версией БД, однако полноценный бэкап базы
+создать невозможно и никакие другие бэкапы без этого также не будут
+создаваться.
+
+Фактически это означает, что база данных теперь находится
+исключительно в оперативной памяти сервера и в любой момент
+может оказаться полностью утерянной. Ситуация критическая,
+принимайте срочные меры." ;;
+
+    28)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, при попытке заменить
+текущую рабочую базу данных вновь созданной GBAK'ом из резервной
+копии тестовой базой, возникла неисправимая ошибка (RV=$2). Служба
+Firebird была остановлена, а перезапустить её не получается, полный
+бэкап БД создать невозможно и никакие другие бэкапы без этого также
+не будут создаваться.
+
+Фактически это означает, что база данных теперь находится
+исключительно в оперативной памяти сервера, пользователи
+не имеют к ней доступа, и в любой момент БД может оказаться
+полностью утерянной. Ситуация очень критическая, принимайте
+срочные меры." ;;
+
+    29)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, при попытке сжать
+полученный ранее архив БД, либо при перемещении полученного из
+него образа БД на место ВЧЕРАШНЕЙ КОПИИ БД (${AUTOSAVEDIR}/OLD.fdb),
+возникла неисправимая ошибка (RV=$2). Служба Firebird остаётся
+запущенной, пользователи могут работать с БД, созданной GBAK'ом
+из резервной копии, однако полный бэкап БД без этого создать
+до конца не получается и никакие другие бэкапы без этого также
+не будут создаваться.
+
+Фактически это означает, что новая БД теперь находится
+исключительно в оперативной памяти сервера и в любой момент
+может оказаться утерянной. Ситуация очень критическая, принимайте
+срочные меры." ;;
+
+    30)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, на самой последней
+стадии создания полного бэкапа БД, возникла неисправимая ошибка
+(RV=$2) - не удаётся создать (или перейти в) директорию месячных
+бэкапов '${MONTHLYBASE}'.
+
+Служба Firebird остаётся запущенной, пользователи могут работать
+с БД, созданной GBAK'ом из резервной копии, однако полный бэкап
+БД без этого создать до конца не получается и никакие другие
+бэкапы без этого также не будут создаваться.
+
+Фактически это означает, что новая БД теперь находится
+исключительно в оперативной памяти сервера и в любой момент
+может оказаться утерянной. Ситуация очень критическая, принимайте
+срочные меры." ;;
+
+    40)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, на самой начальной
+стадии создания инкрементального бэкапа БД ${LEVEL}-го уровня,
+возникла неисправимая ошибка (RV=$2) - не удаётся создать
+(или перейти в) директорию суточных бэкапов: '${AUTOSAVEDIR}/${WEEKDAY}'.
+
+Существует большая вероятность повторения этой ошибки, ситуация
+критическая, поскольку инкрементальные бэкапы не создаются, база
+находится в оперативной памяти сервера только до отключения питания." ;;
+
+    41)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, на стадии
+создания инкрементального бэкапа БД ${LEVEL}-го уровня
+(nbackup/gzip), возникла неисправимая ошибка (RV=$2).
+
+Существует большая вероятность повторения этой ошибки, ситуация
+критическая, поскольку инкрементальные бэкапы не создаются, база
+находится в оперативной памяти сервера только до отключения питания." ;;
+
+    42)
+	MSG="Во время выполнения скрипта $0,
+запущенного $FULLDATE в ${HOURS}:${MINUTES}, на самой последней
+стадии создания инкрементального бэкапа БД ${LEVEL}-го уровня,
+возникла неисправимая ошибка. Команда $ISQLCMD вернула:
+
+---
+$LB
+---
+
+Причиной этого сбоя могло стать одно из двух: либо кто-то работает
+с nbackup параллельно (ручное вмешательство), либо изменился формат
+вывода утилиты $ISQLCMD после очередного обновления Firebird.
+Причину необходимо найти и устранить.
+
+Существует некоторая вероятность повторения этой ошибки, ситуация
+не очень хорошая, поскольку инкрементальные бэкапы не создаются, БД
+находится в оперативной памяти сервера только до отключения питания." ;;
+
+    esac
+    MSG="$MSG
+
+Пожалуйста, не отвечайте на это сообщение.
+Оно создаётся автоматически на хосте ${THISHOST}.
+Если ситуация повторится, новые сообщения не будут
+отправлены вам до тех пор, пока вы не удалите файл
+${ALERTDIR}/$1.msg на хосте ${THISHOST}."
+
+    SUBJECT="$THISHOST needs your immediate intervention (ic-backup)"
+    echo "$MSG" | /root/alert-admin "$SUBJECT" || return $?
+    echo "$FULLDATE ${HOURS}:${MINUTES}" > "${ALERTDIR}/$1.msg"
+    unset MSG SUBJECT
+
+    return 0
+}
+
+
+# Выход с уведомлением администратора о возникшей ошибке
+alert_fail() {
+    alert_admin $1 $2
+    test $1 -le 3 || unlock_workdir
+    exit $1
+}
+
+
+# Обеспечивает  единоразовое уведомление администратора  о том,  что
+# в рабочее время фирмы запущена слишком длинная операция - создание
+# полного суточного бэкапа и/или инкрементального бэкапа 0-го уровня,
+# при условии,  что скрипт действительно был запущен в рабочее время.
+#
+check_work_time() {
+    LB=`echo "$HOURS" | /usr/bin/cut -c1`
+    test $LB -eq 0 && LB=`echo "$HOURS" | /usr/bin/cut -c2` || LB=$HOURS
+    if [ $WARN_WORK_TIME -eq 0 -a $LB -ge 8 -a $LB -le 21 ] ; then
+	WARN_WORK_TIME=1
+	alert_admin 20
+    fi
+    return 0
+}
+
+
+# Создаёт инкрементальный бэкап уровня N ($1)
+make_delta() {
+    LEVEL=$1
+
+    # Перед созданием "снимка" 0-го уровня также выполняем проверку:
+    # нет ли попытки создать этот "снимок" в рабочее время компании?
+    #
+    test $LEVEL -ne 0 || check_work_time
+
+    # При необходимости, создаём директорию
+    if [ -d ${AUTOSAVEDIR}/${WEEKDAY} ] ; then
+	cd ${AUTOSAVEDIR}/${WEEKDAY} || alert_fail 40 $?
+    else
+	mkdir -p ${AUTOSAVEDIR}/${WEEKDAY} && \
+	    cd ${AUTOSAVEDIR}/${WEEKDAY} || alert_fail 40 $?
+    fi
+
+    # Пытаемся  создать  очередной "снимок"  (или "дельту").
+    # В случае неудачи, уведомляем администратора и выходим.
+    #
+    $NBACKUPCMD -b $LEVEL $TMPDATABASE stdout \
+		2>/dev/null | /bin/gzip -9qnc > $TMPBACKUP
+    LB=$?
+    if [ $LB -ne 0 -o ! -r $TMPBACKUP ] ; then
+	rm -f $TMPBACKUP 2>/dev/null
+	alert_fail 41 $LB
+    fi
+
+    # В случае успеха,  проверяем  последнюю запись таблицы историй
+    # бэкапов.  Табличная история бэкапов  призвана  контролировать
+    # целостность цепочки инкрементальных бэкапов.  Утилита nbackup
+    # после каждого успешного бэкапа  создаёт в этой таблице запись,
+    # характеризующую созданный бэкап.  Мы контролируем целостность
+    # цепочки  и по мета-информации в файловой системе, и используя
+    # ту же табличную информацию, что и утилита nbackup.
+    #
+    LB=`(
+	echo -n 'select rdb$backup_id,rdb$backup_level,rdb$guid '
+	echo -n 'from rdb$backup_history where rdb$backup_id = '
+	echo -n '(select max(rdb$backup_id) from rdb$backup_history); '
+	echo 'quit;'
+    ) | $ISQLCMD -s 3 $TMPDATABASE 2>/dev/null | /usr/bin/tail -n2 | \
+    /usr/bin/head -n1 | /usr/bin/awk '{print $1 " " $2 " " $3;}'`
+    LVbkid=""
+    LVguid=""
+    LVno=""
+    if [ -n "$LB" ] ; then
+	LVbkid=`echo "$LB" | /usr/bin/cut -f1 -d ' '`
+	LVno=`echo "$LB"   | /usr/bin/cut -f2 -d ' '`
+	LVguid=`echo "$LB" | /usr/bin/cut -f3 -d ' '`
+    fi
+    if [ -z "$LVbkid" -o -z "$LVguid" -o "x${LVno}" != "x${LEVEL}" ] ; then
+	rm -f $TMPBACKUP 2>/dev/null
+	unset LVbkid LVguid LVno
+	alert_fail 42
+    elif ! eval 'test "$LVbkid" -gt 0' 2>/dev/null ; then
+	rm -f $TMPBACKUP 2>/dev/null
+	unset LVbkid LVguid LVno
+	alert_fail 42
+    fi
+    unset LVno
+
+    # Сохраняем  время последней  модификации  файла БД,  контрольную сумму MD5
+    # получившегося GZ-архива  и его размер,  окончательно перемещаем временный
+    # файл  GZ-архива  в директорию  инкрементальных  бэкапов  последней недели,
+    # создаём ссылки на последние актуальные бэкапы в файле ${AUTOSAVEDIR}/LAST
+    # и файл с мета-информацией о самом бэкапе.
+    #
+    # Общий вид строки в файлах LAST и PREV с полями, разделяемыми пробелами:
+    # <fulldate> <weekday> <level> <L0info> [ <L1info> [ <L2info> ]]
+    #
+    # <fulldate> <weekday> 0 <L0ts> <L0cs> <L0guid>
+    # <fulldate> <weekday> 1 <L0ts> <L0cs> <L0guid> <L1ts> <L1cs> <L1guid>
+    # <fulldate> <weekday> 2 <L0ts> <L0cs> <L0guid> <L1ts> <L1cs> <L1guid> <L2ts> <L2cs> <L2guid>
+    #
+    # fulldate    - Дата запуска сценария в формате YYYY-MM-DD
+    # weekday     - День недели запуска сценария (Sun, Mon, ...)
+    # level       - Номер уровня инкрементального бэкапа (от 0 до 3)
+    #             - Информация о каждом уровне <LVinfo> представлена тремя полями:
+    # ts          - Временная метка в формате hhmm, которой соответствует бэкап
+    # cs          - Контрольная сумма файла NGZ-архива (md5sum)
+    # guid        - Windows-подобный уникальный ID бэкапа из табличной истории
+    #
+    # Более подробная информация о бэкапе  записывается в соответсвующий мета-
+    # информационный файл, также в одну строку, разделённую пробелами.  Формат
+    # этой строки: <fulldate> <hours> <minutes> <level> <hostname> <cs> <guid>
+    # <size> <bkid> [ <p_ts> <p_cs> <p_guid> ]
+    #
+    # fulldate    - Дата запуска сценария в формате YYYY-MM-DD
+    # hours       - Часы запуска сценария в формате hh (00...23)
+    # minutes     - Минуты запуска сценария в формате mm (00...59)
+    # level       - Номер уровня инкрементального бэкапа (от 0 до 3)
+    # hostname    - Имя хоста, на котором создавался данный бэкап
+    # cs          - Контрольная сумма файла NGZ-архива (md5sum)
+    # guid        - Windows-подобный уникальный ID бэкапа из табличной истории
+    # size        - Размер сжатого NGZ-архива (в байтах)
+    # bkid        - Уникальный номер записи в таблице истории инкрементальных бэкапов
+    #             - Для level > 0 также сохраняется информация о т.н. "РОДИТЕЛЬСКОМ" бэкапе:
+    # p_ts        - Временная метка в формате hhmm, которой соответствует РОДИТЕЛЬСКИЙ бэкап
+    # p_cs        - Контрольная сумма файла NGZ-архива (md5sum) для РОДИТЕЛЬСКОГО бэкапа
+    # p_guid      - Windows-подобный уникальный ID РОДИТЕЛЬСКОГО бэкапа из табличной истории
+    #
+    SZ=`/usr/bin/du -b $TMPBACKUP 2>/dev/null | /usr/bin/cut -f1`
+    CS=`/usr/bin/md5sum $TMPBACKUP 2>/dev/null | /usr/bin/cut -f1 -d ' '`
+    LB="$FULLDATE $HOURS $MINUTES $LEVEL $THISHOST $CS $LVguid $SZ $LVbkid"
+    if [ $LEVEL -eq 1 ] ; then
+	LB="$LB $L0ts $L0cs $L0guid"
+    elif [ $LEVEL -eq 2 ] ; then
+	LB="$LB $L1ts $L1cs $L1guid"
+    fi
+    mv -f $TMPBACKUP ${DELTABASE}${BKEXT}
+    echo -n "$LB" > ${DELTABASE}${METAEXT}
+    LB="$FULLDATE $WEEKDAY $LEVEL ${PREVBACKUPS}${HOURS}${MINUTES} $CS $LVguid"
+    if [ -r $FB_LASTFILE ] ; then
+	mv -f $FB_LASTFILE $FB_PREVFILE
+    fi
+    echo -n "$LB" > $FB_LASTFILE
+    CURR_FILE_TIME=`LANG=C /bin/date -r $TMPDATABASE +%s 2>/dev/null`
+    echo -n "$CURR_FILE_TIME" > $LASTMODFILE
+    TS1=`LANG=C /bin/date +%s 2>/dev/null`
+    TS1=`/usr/bin/expr $TS1 - $TS0`
+
+    # Сохраняем эту важную запись в журнале ${WEEKDAY}/history.log
+    LB="$FULLDATE $WEEKDAY $THISHOST $TS1 $CURR_FILE_TIME $LEVEL"
+    LB="$LB ${PREVBACKUPS}${HOURS}${MINUTES} $CS $LVguid $SZ $LVbkid"
+    LASTHIST="${AUTOSAVEDIR}/${WEEKDAY}/lasthist.log"
+    HISTORY="${AUTOSAVEDIR}/${WEEKDAY}/history.log"
+
+    # Журнал "history.log" содержит  всю информацию по инкрементальным
+    # бэкапам,  созданных в текущих сутках.  Он пересоздаётся вместе с
+    # очередным бэкапом 0-го уровня.  Первая запись журнала начинается
+    # с описания именно этого архива 0-го уровня,  но в данном журнале
+    # она будет единственной записью об архиве 0-го уровня. Предыдущая
+    # версия журнала,  при этом,  переименовывается  в  "lasthist.log",
+    # замещаяя собою старую версию последнего.
+    #
+    if [ $LEVEL -eq 0 ] ; then
+	if [ -r $HISTORY ] ; then
+	    mv -f $HISTORY $LASTHIST
+	fi
+	echo "$LB" > $HISTORY
+    elif [ $LEVEL -gt 0 ] ; then
+	if [ -r $HISTORY ] ; then
+	    echo "$LB" >> $HISTORY
+	else
+	    # Вообще-то такого быть не должно!
+	    echo "$LB" > $HISTORY
+	fi
+    fi
+    unset LASTHISH HISTORY
+
+    # Разблокируем рабочий каталог и выходим
+    unlock_workdir
+    exit 0
+}
+
+
+# Проверяет пригодность бэкапа N-го уровня ($1) и его соответствие текущей
+# цепочке инкрементальных бэкапов.  Если бэкап пригоден для восстановления,
+# возвращает 0 (ИСТИНУ). Иначе - вызывает безвозвратную процедуру создания
+# инкрементального бэкапа N-го уровня: make_delta(N).
+#
+check_level() {
+    LVts="$2"
+    LVcs="$3"
+    LVguid="$4"
+    LVhours="$5"
+
+    LVinfo="${AUTOSAVEDIR}/${WEEKDAY}/${LVts}${METAEXT}"
+    LVbackup="${AUTOSAVEDIR}/${WEEKDAY}/${LVts}${BKEXT}"
+    if [ ! -r "$LVinfo" -o ! -r "$LVbackup" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup
+	make_delta $1
+    fi
+    LVinfo=`cat "$LVinfo" 2>/dev/null`
+    if [ -z "$LVinfo" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup
+	make_delta $1
+    fi
+
+    # YYYY-MM-DD
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f1 -d ' '`
+    if [ x"$dummy" != x"$FULLDATE" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy
+	make_delta $1
+    fi
+
+    # hh & mm
+    LVhh=`echo "$LVinfo" | /usr/bin/cut -f2 -d ' '`
+    LVmm=`echo "$LVinfo" | /usr/bin/cut -f3 -d ' '`
+    if [ $1 -eq 1 -a -n "$LVhours" -a x"${LVhh}" != x"$LVhours" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup LVhh LVmm dummy
+	make_delta $1
+    elif [ x"${LVhh}${LVmm}" != x"$LVts" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup LVhh LVmm dummy
+	make_delta $1
+    fi
+    unset LVhh LVmm
+
+    # Level
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f4 -d ' '`
+    if [ x"$dummy" != x"$1" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy
+	make_delta $1
+    fi
+
+    # Hostname (поле #5) - здесь не используется
+
+    # MD5
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f6 -d ' '`
+    if [ x"$dummy" != x"$LVcs" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy
+	make_delta $1
+    fi
+
+    # GUID
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f7 -d ' '`
+    if [ x"$dummy" != x"$LVguid" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy
+	make_delta $1
+    fi
+
+    # Size
+    dummy=`echo "$LVinfo" | /usr/bin/cut -f8 -d ' '`
+    dummy1=`/usr/bin/du -b "$LVbackup" 2>/dev/null | /usr/bin/cut -f1`
+    if [ x"$dummy" != x"$dummy1" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy dummy1
+	make_delta $1
+    fi
+    unset dummy1
+
+    # BackupID and chain
+    LVbkid=`echo "$LVinfo" | /usr/bin/cut -f9 -d ' '`
+    if ! eval 'test "$LVbkid" -gt 0' >/dev/null 2>&1 ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup LVbkid dummy
+	make_delta $1
+    fi
+    dummy=`(
+	echo -n 'select rdb$guid from rdb$backup_history where '
+	echo -n '(rdb$backup_level = '$1') and (rdb$backup_id '
+	echo '= '${LVbkid}'); quit;'
+    ) | $ISQLCMD -s 3 $TMPDATABASE 2>/dev/null | \
+    /usr/bin/tail -n2 | /usr/bin/head -n1 | /bin/sed 's/ //g'`
+    if [ x"$dummy" != x"$LVguid" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup LVbkid dummy
+	make_delta $1
+    fi
+    dummy=`(
+	echo -n 'select max(rdb$backup_id) from rdb$backup_history '
+	echo 'where (rdb$backup_level = '$1'); quit;'
+    ) | $ISQLCMD -s 3 $TMPDATABASE 2>/dev/null | \
+    /usr/bin/tail -n2 | /usr/bin/head -n1 | /bin/sed 's/ //g'`
+    if [ x"$dummy" != x"$LVbkid" ] ; then
+	unset LVts LVcs LVguid LVhours LVinfo LVbackup LVbkid dummy
+	make_delta $1
+    fi
+    unset LVbkid
+
+    # Link to the parent level-0 from the level-1
+    if [ $1 -eq 1 ]
+    then
+	# p_ts (L0 <hhmm>)
+	dummy=`echo "$LVinfo" | /usr/bin/cut -f10 -d ' '`
+	if [ x"$dummy" != x"$L0ts" ] ; then
+	    unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy
+	    make_delta $1
+	fi
+
+	# p_cs (L0 <md5>)
+	dummy=`echo "$LVinfo" | /usr/bin/cut -f11 -d ' '`
+	if [ x"$dummy" != x"$L0cs" ] ; then
+	    unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy
+	    make_delta $1
+	fi
+
+	# p_guid (L0 <guid>)
+	dummy=`echo "$LVinfo" | /usr/bin/cut -f12 -d ' '`
+	if [ x"$dummy" != x"$L0guid" ] ; then
+	    unset LVts LVcs LVguid LVhours LVinfo LVbackup dummy
+	    make_delta $1
+	fi
+    fi
+
+    unset LVts LVcs LVguid LVbkid LVinfo LVbackup dummy
+    return 0
+}
+
+
+# Проверяем наличие обязательных утилит и службы Firebird
+test -x $GBAKCMD -a -x $GFIXCMD -a -x $ISQLCMD || exit 1
+test -x $NBACKUPCMD -a -x $FB_SERVICE || exit 1
+
+# При наличии незавершённого бэкапа,  пропускаем  текущий
+# "снимок".  Устанавливаем  маску  для  всего,  что будет
+# создавать данный скрипт. Удаляем "хвосты" от предыдущих
+# неудавшихся  бэкапов.
+#
+test -d "$WORKDIR" || exit 0
+umask 0077 ; try_lock_workdir || alert_fail 3
+rm -f $TMPOLDBASE $TMPQTESTDB ${AUTOSAVEDIR}/current-* 2>/dev/null
+
+# Удаляем файлы одноимённой "дельты", при условии, что они
+# были сделаны не сегодня  (если же эти файлы были созданы
+# сегодня, в ту же самую минуту, то просто выходим). Таким
+# образом,  мы,  с одной стороны,  экономим место на диске,
+# удаляя совсем устаревшие файлы  (как правило,  недельной
+# давности), с другой стороны, - предотвращаем последствия
+# от чрезмерно частых повторных запусков этого скрипта.
+#
+if [ -r ${DELTABASE}${METAEXT} ] ; then
+    LB=`/usr/bin/cut -f1 -d ' ' ${DELTABASE}${METAEXT}`
+    if [ "x${LB}" = "x${FULLDATE}" ] ; then
+	unlock_workdir
+	exit 0
+    fi
+fi
+rm -f ${DELTABASE}${METAEXT} ${DELTABASE}${BKEXT} 2>/dev/null
+
+# Нет смысла создавать очередные "снимки",
+# если Firebird не запущен на этом сервере
+#
+if [ ! -r $TMPDATABASE -o ! -r $FB_DATABASE_SERVICE ] ; then
+    unlock_workdir ; exit 0
+elif ! fb_svc status ; then
+    unlock_workdir ; exit 0
+fi
+
+# Создаём полный "ежесуточный" бэкап,  если сегодня он ещё не создавался.
+# Поскольку данная процедура отнимает значительное время и много ресуров,
+# её следует выполнять исключительно в нерабочее время. Тем более, что в
+# процессе её выполнения сервер Firebird будет перезапущен.  Но по утрам
+# выходных и праздничных дней  пропускаем создание  полных "ежесуточных"
+# бэкапов и переходим к созданию инкрементального бэкапа 0-го уровня.
+#
+if test ! -r $DAILYFULL && is_workday "${TODAY}.${MONTH}"
+then
+    # При создании  полного "ежесуточного" бэкапа  не ориентируемся на
+    # время последней модификации БД,  поскольку инкрементальный бэкап
+    # 0-го уровня придётся создать в любом случае. Если скрипт запущен
+    # в рабочее время,  уведомляем об этом администратора  и  отмечаем
+    # для себя, что данное уведомление ему уже направлено.
+    #
+    rm -f $LASTMODFILE 2>/dev/null
+    check_work_time
+    fb_deauth
+
+    # Пытаемся остановить Firebird
+    fb_svc stop || fb_svc stop ; LB=$?
+    fb_svc status && alert_fail 21 $LB
+
+    # Создаём на жёстком диске сервера теневую копию образа рабочей БД.
+    # В любом случае пытаемся перезапустить Firebird. В случае неудачи,
+    # удаляем недокопированный файл базы и уведомляем администратора.
+    #
+    LB=0
+    mv -f $TMPDATABASE $TMPOLDBASE 2>/dev/null || LB=$?
+    cp -af $TMPOLDBASE $TMPSHADOW 2>/dev/null || LB=$?
+    /bin/sync ; fb_svc start || fb_svc restart
+    /bin/sleep 2 ; fb_svc status || LB=$?
+    if [ $LB -ne 0 ] ; then
+	test -r $TMPOLDBASE && mv -f $TMPOLDBASE $TMPDATABASE
+	fb_svc start || fb_svc restart
+	rm -f $TMPSHADOW 2>/dev/null
+	fb_svc status && alert_fail 22 $LB
+	alert_fail 23 $LB
+    fi
+    fb_auth
+
+    # Оптимизируем теневую копию рабочей БД, вычищая из неё весь "мусор".
+    $GFIXCMD -sweep $TMPSHADOW >/dev/null 2>&1
+
+    # Выгружаем gbak'ом из теневой копии рабочей базы  все данные в FBK-файл
+    # на жёстком диске сервера. Владельцем этого FBK-файла будет стандартный
+    # пользователь "firebird".  В случае неудачи,  удаляем не нужные файлы и
+    # уведомляем администратора.
+    #
+    $GBAKCMD -b -g $TMPSHADOW $TMPDAILY >/dev/null 2>&1 || LB=$?
+    if [ $LB -ne 0 -o ! -r $TMPDAILY ] ; then
+	rm -f $TMPSHADOW $TMPDAILY 2>/dev/null
+	mv -f $TMPOLDBASE $TMPDATABASE
+	alert_fail 24 $LB
+    fi
+
+    #
+    # В случае успеха, выполняем сразу несколько шагов: создаём совершенно
+    # новую базу  из полученного FBK-архива,  проверяем её консистентность,
+    # останавливаем  сервер Firebird,  меняем старую рабочую базу на новую,
+    # запускаем  сервер Firebird,  сжимаем FBK-файл в  BZ2-архив,  считаем
+    # MD5-хэш полученного архива, сохраняем сведения об архиве для истории.
+    # Если что-то из перечисленного пошло не так,  возвращаем назад старую
+    # рабочую базу,  снова перезапускаем  сервер Firebird  и уведомляем об
+    # этом администратора.
+    #
+
+    # Создаём на жёстком диске сервера новую (тестовую) базу, загружая в неё
+    # данные из только что созданного на жёстком диске FBK-файла,  проверяем
+    # консистентность созданной базы и копируем её на TMPFS-раздел. В случае
+    # неудачи, удаляем не нужные файлы и уведомляем администратора.
+    #
+    $GBAKCMD -c $TMPDAILY $TMPTESTBASE >/dev/null 2>&1 && test -r $TMPTESTBASE \
+		&& $GFIXCMD -validate -full $TMPTESTBASE >/dev/null 2>&1 && \
+		cp -af $TMPTESTBASE $TMPQTESTDB 2>/dev/null || LB=$?
+    rm -f $TMPSHADOW 2>/dev/null
+    if [ $LB -ne 0 ] ; then
+	rm -f $TMPTESTBASE $TMPDAILY $TMPQTESTDB 2>/dev/null
+	mv -f $TMPOLDBASE $TMPDATABASE
+	alert_fail 25 $LB
+    fi
+
+    # Снова пытаемся остановить Firebird
+    fb_deauth ; fb_svc stop || fb_svc stop ; LB=$?
+    if fb_svc status ; then
+	rm -f $TMPTESTBASE $TMPDAILY $TMPQTESTDB 2>/dev/null
+	mv -f $TMPOLDBASE $TMPDATABASE
+	alert_fail 26 $LB
+    fi
+
+    # Заменяем тестовой текущую рабочую базу и снова перезапускаем Firebird.
+    # В случае неудачи, удаляем не нужные файлы и уведомляем администратора.
+    #
+    mv -f $TMPQTESTDB $TMPDATABASE 2>/dev/null || LB=$?
+    /bin/sync ; fb_svc start || fb_svc restart
+    /bin/sleep 2 ; fb_svc status || LB=$?
+    if [ $LB -ne 0 ] ; then
+	test -r $TMPQTESTDB && mv -f $TMPOLDBASE $TMPDATABASE
+	rm -f $TMPTESTBASE $TMPDAILY $TMPQTESTDB $TMPOLDBASE 2>/dev/null
+	fb_svc status && alert_fail 27 $LB
+	alert_fail 28 $LB
+    fi
+
+    # В случае успеха, сжимаем FBK-файл в BZ2-архив и удаляем не нужные файлы
+    /bin/bzip2 -9qc < $TMPDAILY > $TMPBACKUP 2>/dev/null || LB=$?
+    chown 0:0 $TMPTESTBASE 2>/dev/null && chmod 600 $TMPTESTBASE 2>/dev/null && \
+    mv -f $TMPTESTBASE ${AUTOSAVEDIR}/OLD.fdb 2>/dev/null || LB=$?
+    rm -f $TMPTESTBASE $TMPOLDBASE $TMPDAILY 2>/dev/null
+    if [ $LB -ne 0 ] ; then
+	rm -f $TMPBACKUP 2>/dev/null
+	alert_fail 29 $LB
+    fi
+
+    # В случае успеха - вычисляем контрольную сумму BZ2-архива,  окончательно
+    # перемещаем этот BZ2-архив в папку полных "ежесуточных" бэкапов (создаём
+    # эту папку,  при необходимости),  сохраняем  сведения о созданном архиве
+    # для истории и начинаем новую цепочку с бэкапа 0-го уровня.
+    #
+    CS=`/usr/bin/md5sum $TMPBACKUP 2>/dev/null | /usr/bin/cut -f1 -d ' '`
+    SZ=`/usr/bin/du -b $TMPBACKUP 2>/dev/null | /usr/bin/cut -f1`
+    if [ -d $MONTHLYBASE ] ; then
+	cd $MONTHLYBASE || alert_fail 30 $?
+    else
+	mkdir -p $MONTHLYBASE && \
+	    cd $MONTHLYBASE || alert_fail 30 $?
+    fi
+    mv -f $TMPBACKUP $DAILYFULL 2>/dev/null
+    LB="${MONTHLYBASE}/history.log"
+    test -r $LB || :> $LB
+    fb_auth
+    TS1=`LANG=C /bin/date +%s 2>/dev/null`
+    TS0=`/usr/bin/expr $TS1 - $TS0`
+    echo "$FULLDATE ${HOURS}:${MINUTES} $THISHOST daily-${TODAY}.gbz $CS $SZ $TS0" >> $LB
+    TS0=$TS1
+    make_delta 0
+fi
+
+
+# Если указатель на  сегодняшнюю цепочку инкрементальных бэкапов
+# отсутствует, то начинаем новую цепочку со "снимка" 0-го уровня
+#
+fb_auth ; test -r $FB_LASTFILE || make_delta 0
+LB=`/usr/bin/cut -c1-15 $FB_LASTFILE 2>/dev/null`
+test x"$LB" = x"$FULLDATE $WEEKDAY " || make_delta 0
+
+# 16-ый символ - номер уровня от 0 до 2, реквизиты каждого
+# уровня, начиная с 0-го,  следует считать с 18-го символа
+#
+LEVEL=`/usr/bin/cut -c16 $FB_LASTFILE 2>/dev/null`
+LB=`/usr/bin/cut -c18- $FB_LASTFILE 2>/dev/null`
+
+# Проверяем пригодность бэкапа 0-го уровня
+L0ts=`echo "$LB" | /usr/bin/cut -f1 -d ' '`
+L0cs=`echo "$LB" | /usr/bin/cut -f2 -d ' '`
+L0guid=`echo "$LB" | /usr/bin/cut -f3 -d ' '`
+check_level 0 "$L0ts" "$L0cs" "$L0guid"
+PREVBACKUPS="$L0ts $L0cs $L0guid "
+
+# Определяем время последней модификации рабочей БД и сравниваем его  с
+# последним сохранённым значением. Создание очередной "дельты" не имеет
+# смысла при отсутсвии каких-либо изменений.
+#
+if [ -r $LASTMODFILE ] ; then
+    LAST_SYNC_TIME=`cat $LASTMODFILE 2>/dev/null`
+    CURR_FILE_TIME=`LANG=C /bin/date -r $TMPDATABASE +%s 2>/dev/null`
+    if [ "$CURR_FILE_TIME" = "$LAST_SYNC_TIME" ] ; then
+	unset LAST_SYNC_TIME CURR_FILE_TIME
+	unlock_workdir
+	exit 0
+    fi
+    unset LAST_SYNC_TIME CURR_FILE_TIME
+fi
+
+# Проверяем пригодность бэкапа 1-го уровня
+test x"$LEVEL" = x"0" && make_delta 1 || unset LEVEL
+LB=`/usr/bin/cut -c18- $FB_LASTFILE 2>/dev/null`
+L1ts=`echo "$LB" | /usr/bin/cut -f4 -d ' '`
+L1cs=`echo "$LB" | /usr/bin/cut -f5 -d ' '`
+L1guid=`echo "$LB" | /usr/bin/cut -f6 -d ' '`
+check_level 1 "$L1ts" "$L1cs" "$L1guid" "$HOURS"
+PREVBACKUPS="${PREVBACKUPS}${L1ts} $L1cs $L1guid "
+
+# Поскольку пригодными оказались оба бэкапа,
+# создаём бэкап-"пятиминутку" (2-го уровня)
+#
+make_delta 2
